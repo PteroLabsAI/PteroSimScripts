@@ -36,7 +36,7 @@ except ImportError:
     cv2 = None
 
 
-def launch_pterosim() -> subprocess.Popen:
+def launch_pterosim() -> subprocess.Popen[bytes]:
     """Start PteroSim.exe as a background process."""
     print(f"Launching PteroSim: {PTEROSIM_EXE}")
     proc = subprocess.Popen(
