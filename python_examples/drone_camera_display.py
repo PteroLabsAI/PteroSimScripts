@@ -6,15 +6,10 @@ Every frame's round-trip (request -> frame in hand) is measured; a summary is pr
 every --report-every frames and, with --latency-log, every frame goes to a CSV.
 
 Usage:
-    # 1. Start PteroSim manually:
-    #    PteroSim.exe   (or Play in Editor from UE5)
-
-    # 2. Then run this script:
-    python drone_camera_display.py [--aircraft x500] [--width 1280] [--height 720]
+    # 1. Start PteroSim (PteroSim.exe, or Play in Editor from UE5)
+    # 2. python drone_camera_display.py [--aircraft x500] [--width 1280] [--height 720]
 
 Options:
-    --launch        Also launch PteroSim if not already running (needs --exe)
-    --exe           Path to PteroSim.exe for --launch
     --aircraft      Aircraft class to spawn (default F450)
     --camera        Camera sensor name (default: the first camera on the aircraft)
     --width         Camera frame width (default 1280)
@@ -27,7 +22,6 @@ Options:
 
 import argparse
 import statistics
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -44,33 +38,15 @@ except ImportError:
     cv2 = None
 
 
-def launch_pterosim(exe: Path) -> subprocess.Popen[bytes]:
-    """Start PteroSim.exe as a background process."""
-    print(f"Launching PteroSim: {exe}")
-    proc = subprocess.Popen(
-        [str(exe)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    print(f"  PID: {proc.pid}")
-    return proc
-
-
-def wait_for_grpc(address: str, timeout: float = 90.0) -> PteroSim:
-    """Poll gRPC until the server is up."""
-    print(f"Waiting for gRPC server on {address} ...")
-    deadline = time.time() + timeout
-    last_error = None
-    while time.time() < deadline:
-        try:
-            sim = PteroSim(address)
-            status = sim.status()
-            print(f"  Connected! running={status.is_running}, aircraft={status.aircraft_count}")
-            return sim
-        except Exception as e:
-            last_error = e
-            time.sleep(2)
-    raise TimeoutError(f"gRPC server not reachable after {timeout}s: {last_error}")
+def connect(address: str) -> PteroSim:
+    """Connect to the running PteroSim; it is not started from here."""
+    try:
+        sim = PteroSim(address)
+        status = sim.status()
+    except Exception as e:  # grpc's error text is a paragraph; the reason is enough
+        raise SystemExit(f"PteroSim is not reachable on {address} (start it first): {type(e).__name__}") from None
+    print(f"Connected to {address}: running={status.is_running}, aircraft={status.aircraft_count}")
+    return sim
 
 
 def report(rtts_ms: list[float], frames: int, elapsed_s: float) -> None:
@@ -90,8 +66,6 @@ def report(rtts_ms: list[float], frames: int, elapsed_s: float) -> None:
 def main() -> None:
     """Display the selected drone's live camera feed and log its latency."""
     parser = argparse.ArgumentParser(description="Display PteroSim drone camera feed")
-    parser.add_argument("--launch", action="store_true", help="Launch PteroSim if not already running")
-    parser.add_argument("--exe", type=Path, help="Path to PteroSim.exe (required with --launch)")
     parser.add_argument("--aircraft", default="F450", help="Aircraft class to spawn (default F450)")
     parser.add_argument("--camera", default="", help="Camera sensor name (default: first camera found)")
     parser.add_argument("--width", type=int, default=1280, help="Camera frame width")
@@ -105,24 +79,16 @@ def main() -> None:
     if cv2 is None:
         print("OpenCV (cv2) is required. Install with: pip install opencv-python")
         sys.exit(1)
-    if args.launch and args.exe is None:
-        parser.error("--launch requires --exe")
 
-    sim_process = None
     sim = None
     we_started = False
     csv = args.latency_log.open("w", encoding="utf-8") if args.latency_log else None
     if csv:
         csv.write("seq,wall_s,sim_t,rtt_ms\n")
     try:
-        # Step 1: Optionally launch PteroSim
-        if args.launch:
-            sim_process = launch_pterosim(args.exe)
+        sim = connect(GRPC_ADDRESS)
 
-        # Step 2: Connect gRPC
-        sim = wait_for_grpc(GRPC_ADDRESS)
-
-        # Step 3: Spawn drone if not already present
+        # Spawn a drone if the scene is empty
         status = sim.status()
         if status.aircraft_count == 0:
             print(f"Spawning {args.aircraft} ...")
@@ -132,7 +98,7 @@ def main() -> None:
             drone = sim.get_aircraft(args.instance)
             print(f"Using existing aircraft instance_id={args.instance}")
 
-        # Step 4: Start simulation
+        # Start the simulation unless it already runs
         if not status.is_running:
             print("Starting simulation ...")
             sim.set_time_scale(1.0)
@@ -150,7 +116,7 @@ def main() -> None:
         camera = cameras[0]
         print(f"Camera sensor: {camera.name} ({camera.update_hz} Hz)")
 
-        # Step 5: Stream frames to screen
+        # Pull frames to the screen
         print(f"\nDisplaying camera feed {args.width}x{args.height} ...")
         print("Press 'q' or Esc to quit.\n")
 
@@ -216,10 +182,6 @@ def main() -> None:
                 print("Simulation stopped.")
             except Exception:
                 pass
-        if sim_process is not None:
-            sim_process.terminate()
-            sim_process.wait(timeout=5)
-            print("PteroSim terminated.")
         try:
             cv2.destroyAllWindows()
         except Exception:
