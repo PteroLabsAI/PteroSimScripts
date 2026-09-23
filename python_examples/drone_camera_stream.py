@@ -115,10 +115,8 @@ def view(host: str, port: int, seconds: float) -> None:
                 2,
             )
             cv2.imshow(window, img)
-            # The window's own close button is not a key: without asking whether it is still there, closing it
-            # leaves this loop decoding a stream nobody watches and the simulation running behind it.
             if cv2.waitKey(1) & 0xFF in (ord("q"), ESC_KEY) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
-                break
+                break  # the close button is not a key
     finally:
         cap.release()
         cv2.destroyAllWindows()
