@@ -161,8 +161,8 @@ def main() -> None:
                 t_report = now
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == ESC_KEY:
-                break
+            if key == ord("q") or key == ESC_KEY or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
+                break  # the close button is not a key
             if args.max_frames and frame_count >= args.max_frames:
                 print(f"Reached {args.max_frames} frames, exiting.")
                 break
