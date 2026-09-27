@@ -47,14 +47,15 @@ under a virtualenv that has PyAV; run `view` under one that has PySide6.
 """
 
 import argparse
+import functools
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 DEFAULT_TILE = "768x480"
 MANIFEST = str(Path.home() / "camera_fleet.json")
@@ -64,49 +65,96 @@ COLS = 2
 
 # --------------------------------------------------------------------------- shared
 
-def local_address():
-    """This machine's IPv4 address, which is what the simulator must aim the stream at.
+
+def local_address() -> str:
+    """Return this machine's own IPv4 address, the one the simulator must aim a stream at.
 
     A connected UDP socket picks the source address the kernel would use to leave, without
     sending anything. Under WSL this changes across restarts, so it is read at run time.
     """
     import socket
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+        return str(s.getsockname()[0])
     finally:
         s.close()
 
 
-def write_sdp(host, port):
-    """The session description a decoder needs to open a bare RTP/H.264 stream."""
+def write_sdp(host: str, port: int) -> Path:
+    """Write the session description a decoder needs to open a bare RTP/H.264 stream.
+
+    Payload type 96 says nothing on its own and ffmpeg takes such a description only from a
+    file, so the stream cannot be opened without one.
+
+    Args:
+    ----
+        host: Address the stream is sent to, which the description also names.
+        port: RTP port to receive on.
+
+    Returns:
+    -------
+        Path of the SDP file written into the temporary directory.
+
+    """
     path = Path(tempfile.gettempdir()) / f"pterosim_stream_{port}.sdp"
-    path.write_text("\n".join([
-        "v=0",
-        f"o=- 0 0 IN IP4 {host}",
-        "s=PteroSim camera",
-        f"c=IN IP4 {host}",
-        "t=0 0",
-        f"m=video {port} RTP/AVP 96",
-        "a=rtpmap:96 H264/90000",
-    ]) + "\n")
+    path.write_text(
+        "\n".join(
+            [
+                "v=0",
+                f"o=- 0 0 IN IP4 {host}",
+                "s=PteroSim camera",
+                f"c=IN IP4 {host}",
+                "t=0 0",
+                f"m=video {port} RTP/AVP 96",
+                "a=rtpmap:96 H264/90000",
+            ]
+        )
+        + "\n"
+    )
     return path
 
 
-def open_stream(host, port):
+def open_stream(host: str, port: int) -> Any:
+    """Open one aircraft's RTP/H.264 stream as an ffmpeg container.
+
+    format="sdp" is required -- by extension alone ffmpeg does not pick the SDP demuxer --
+    and protocol_whitelist is what lets that demuxer open the nested rtp/udp stream, the same
+    option drone_camera_stream.py sets for OpenCV.
+
+    Args:
+    ----
+        host: Address the stream is sent to.
+        port: RTP port to receive on.
+
+    Returns:
+    -------
+        An av container holding the video stream.
+
+    """
     import av
-    sdp = write_sdp(host, port)
-    return av.open(str(sdp), format="sdp",
-                   options={"protocol_whitelist": "file,rtp,udp"})
+
+    return av.open(str(write_sdp(host, port)), format="sdp", options={"protocol_whitelist": "file,rtp,udp"})
 
 
-def parse_tile(text):
+def parse_tile(text: str) -> tuple[int, int]:
+    """Split a WIDTHxHEIGHT tile description.
+
+    Args:
+    ----
+        text: Tile size such as "768x480".
+
+    Returns:
+    -------
+        The width and the height.
+
+    """
     w, h = text.lower().split("x")
     return int(w), int(h)
 
 
-def ensure_ros():
+def ensure_ros() -> None:
     """Re-exec under a sourced ROS 2 environment if rclpy is not importable yet.
 
     rclpy lives in the ROS install's site-packages, which only its setup script puts on
@@ -117,17 +165,19 @@ def ensure_ros():
     """
     try:
         import rclpy  # noqa: F401
-        return
     except ImportError:
         pass
+    else:
+        return
 
     if os.environ.get("PTEROSIM_CAMERAS_REEXEC"):
         raise SystemExit("rclpy still not importable after sourcing ROS 2")
 
     setups = sorted(Path("/opt/ros").glob("*/setup.bash"))
     if not setups:
-        raise SystemExit("rclpy not found and no /opt/ros/*/setup.bash to source; "
-                         "source your ROS 2 install and retry")
+        raise SystemExit(
+            "rclpy not found and no /opt/ros/*/setup.bash to source; " "source your ROS 2 install and retry"
+        )
     # sys.argv[1:], not sys.argv: argv[0] is this script, which is already named by __file__.
     argv = " ".join(f'"{a}"' for a in sys.argv[1:])
     script = f'source "{setups[-1]}" && exec "{sys.executable}" "{os.path.abspath(__file__)}" {argv}'
@@ -137,12 +187,22 @@ def ensure_ros():
 
 # --------------------------------------------------------------------------- setup
 
-def cmd_setup(args):
-    """Spawn the fleet and point every camera at this machine, then start the simulation."""
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Spawn the fleet, point every camera at this machine, and start the simulation.
+
+    Args:
+    ----
+        args: Parsed command line, holding the fleet size, tile, fps and addresses.
+
+    Returns:
+    -------
+        Zero on success.
+
+    """
     sdk = os.environ.get("PTEROSIM_SDK", "")
     if not sdk:
-        default = ("/mnt/c/Users/Yollnahkriin/Documents/Unreal_Projects/PteroSim/"
-                   "Plugins/PteroSimScripting/SDK/python")
+        default = "/mnt/c/Users/Yollnahkriin/Documents/Unreal_Projects/PteroSim/" "Plugins/PteroSimScripting/SDK/python"
         sdk = default if Path(default).exists() else ""
     if sdk:
         sys.path.insert(0, sdk)
@@ -166,7 +226,7 @@ def cmd_setup(args):
             drone = sim.spawn(args.aircraft, x=-492.0 + 8.0 * n, y=-199.0, z=30.0, yaw=0.0)
             print(f"spawned {args.aircraft} instance_id={drone.instance_id}")
             have = sorted(set(have) | {drone.instance_id})
-        have = have[:args.count]
+        have = have[: args.count]
 
         streams = []
         for i in have:
@@ -183,12 +243,19 @@ def cmd_setup(args):
             # stream_port is per aircraft, so the real port steps by two.
             stream_port = args.base_port + i
             drone.set_sensor_param(
-                cam.name, update_hz=args.fps, image_width=width, image_height=height,
-                stream=True, stream_port=stream_port, stream_host=host)
+                cam.name,
+                update_hz=args.fps,
+                image_width=width,
+                image_height=height,
+                stream=True,
+                stream_port=stream_port,
+                stream_host=host,
+            )
             aircraft = getattr(drone, "aircraft_name", None) or args.aircraft
             topic = f"/{aircraft}_{i}/{cam.name}/image_raw"
-            streams.append({"instance_id": i, "aircraft": aircraft, "camera": cam.name,
-                            "port": stream_port + i, "topic": topic})
+            streams.append(
+                {"instance_id": i, "aircraft": aircraft, "camera": cam.name, "port": stream_port + i, "topic": topic}
+            )
             print(f"  instance {i}: {cam.name} -> udp://{host}:{stream_port + i}  {topic}")
 
         sim.start()
@@ -196,17 +263,26 @@ def cmd_setup(args):
         # Channel close only. shutdown() would take the whole simulator down.
         sim.close()
 
-    Path(MANIFEST).write_text(json.dumps(
-        {"host": host, "tile": [width, height], "streams": streams}, indent=2))
+    Path(MANIFEST).write_text(json.dumps({"host": host, "tile": [width, height], "streams": streams}, indent=2))
     print(f"\nsimulation started; wrote {MANIFEST}")
     return 0
 
 
 # -------------------------------------------------------------------------- bridge
 
-def cmd_bridge(args):
-    """Decode each stream and publish it as sensor_msgs/msg/Image."""
-    import av
+
+def cmd_bridge(args: argparse.Namespace) -> int:
+    """Decode each stream in the manifest and publish it as a sensor_msgs/msg/Image topic.
+
+    Args:
+    ----
+        args: Parsed command line, holding the manifest path and report period.
+
+    Returns:
+    -------
+        Zero on success.
+
+    """
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
@@ -218,7 +294,7 @@ def cmd_bridge(args):
     class Stream(threading.Thread):
         """Decodes one aircraft's stream and publishes every frame it decodes."""
 
-        def __init__(self, node, host, port, topic):
+        def __init__(self, node: Any, host: str, port: int, topic: str) -> None:
             super().__init__(daemon=True)
             self.node = node
             self.port = port
@@ -232,7 +308,7 @@ def cmd_bridge(args):
             self.vstream = self.container.streams.video[0]
             self.size = f"{self.vstream.width}x{self.vstream.height}"
 
-        def run(self):
+        def run(self) -> None:
             try:
                 for frame in self.container.decode(self.vstream):
                     msg = Image()
@@ -246,45 +322,42 @@ def cmd_bridge(args):
                     msg.data = frame.to_ndarray(format="rgb24").tobytes()
                     self.pub.publish(msg)
                     self.frames += 1
-            except Exception as exc:  # noqa: BLE001
-                # One lost stream must not take the other aircraft down with it.
+            except Exception as exc:
+                # One lost stream must not take the other aircraft down with it. Deliberately
+                # broad: anything ffmpeg or the transport raises ends the stream, and the
+                # other aircraft's threads have to survive it.
                 self.error = f"{type(exc).__name__}: {exc}"
                 self.node.get_logger().error(f"{self.topic}: {self.error}")
 
-        def close(self):
+        def close(self) -> None:
+            """Close the underlying container."""
             self.container.close()
 
-    class Bridge(Node):
-        def __init__(self):
-            super().__init__("pterosim_camera")
-            # Built after super().__init__ because each stream needs the node to publish on.
-            self.streams = [Stream(self, host, p_, t) for p_, t in pairs]
-            for s in self.streams:
-                s.start()
-                self.get_logger().info(
-                    f"publishing {s.topic}  {s.size} from udp port {s.port}")
-            self.create_timer(args.report, self.report)
-
-        def report(self):
-            for s in self.streams:
-                hz = s.frames / max(1e-6, time.time() - s.started)
-                line = f"{s.topic}  {s.frames} frames  {hz:5.1f} Hz  {s.size}"
-                self.get_logger().info(line + (f"  ERROR {s.error}" if s.error else ""))
-
-        def close(self):
-            for s in self.streams:
-                s.close()
-
     rclpy.init()
-    node = None
+    # A plain node rather than a subclass: rclpy ships no type stubs, so a base class of
+    # type Any is exactly what mypy --strict refuses to subclass. The report state belongs
+    # to this function anyway.
+    node = Node("pterosim_camera")
+    streams = [Stream(node, host, port, topic) for port, topic in pairs]
+    for s in streams:
+        s.start()
+        node.get_logger().info(f"publishing {s.topic}  {s.size} from udp port {s.port}")
+
+    def report() -> None:
+        """Log one line per stream with its running average."""
+        for s in streams:
+            hz = s.frames / max(1e-6, time.time() - s.started)
+            line = f"{s.topic}  {s.frames} frames  {hz:5.1f} Hz  {s.size}"
+            node.get_logger().info(line + (f"  ERROR {s.error}" if s.error else ""))
+
+    node.create_timer(args.report, report)
     try:
-        node = Bridge()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        if node is not None:
-            node.close()
+        for s in streams:
+            s.close()
         if rclpy.ok():
             rclpy.shutdown()
     return 0
@@ -292,11 +365,22 @@ def cmd_bridge(args):
 
 # ----------------------------------------------------------------------------- view
 
-def cmd_view(args):
-    """Fullscreen tiled view of every camera topic on the bus."""
+
+def cmd_view(args: argparse.Namespace) -> int:
+    """Show every camera topic on the bus in one fullscreen tiled window.
+
+    Args:
+    ----
+        args: Parsed command line, holding the tile size.
+
+    Returns:
+    -------
+        Zero on success.
+
+    """
     import numpy as np
     import rclpy
-    from PySide6.QtCore import Qt, QRect, QTimer
+    from PySide6.QtCore import QRect, Qt, QTimer
     from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
     from PySide6.QtWidgets import QApplication, QGridLayout, QLabel, QWidget
     from rclpy.node import Node
@@ -304,15 +388,24 @@ def cmd_view(args):
     from sensor_msgs.msg import Image
 
     width, height = parse_tile(args.tile)
-    rows = max(1, args.rows)
 
-    def to_qimage(msg, caption=""):
-        """rgb8 Image -> QImage, copied, with the caption painted into the pixels.
+    def to_qimage(msg: Any, caption: str = "") -> Any:
+        """Convert an rgb8 Image into a QImage, copied, with a caption painted in.
 
         The numpy array is a view onto msg.data, which the next message replaces, so handing
         it to QImage uncopied would show torn frames. The caption goes into the image rather
         than the layout: a layout label would shrink the tile, and the tiles are sized to
         cover the screen exactly.
+
+        Args:
+        ----
+            msg: The image message.
+            caption: Text drawn into the top-left corner, if any.
+
+        Returns:
+        -------
+            A QImage that owns its own pixel data.
+
         """
         h, w = int(msg.height), int(msg.width)
         arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, msg.step // 3, 3)[:, :w, :3]
@@ -329,10 +422,18 @@ def cmd_view(args):
 
     rclpy.init()
     node = Node("pterosim_camera_view")
-    latest, counts = {}, {}
-    subs = []
+    latest: dict[str, Any] = {}
+    counts: dict[str, int] = {}
 
-    def on_image(topic, msg):
+    def on_image(topic: str, msg: Any) -> None:
+        """Record the newest frame for a topic.
+
+        Args:
+        ----
+            topic: Topic the frame arrived on.
+            msg: The image message.
+
+        """
         latest[topic] = msg
         counts[topic] += 1
 
@@ -349,11 +450,23 @@ def cmd_view(args):
     grid.setContentsMargins(0, 0, 0, 0)
     grid.setSpacing(0)
 
-    tiles = {}
-    state = {"fps_t": time.time(), "fps": {}, "logged": time.time()}
-    known = set()
+    # topic -> [image label, last frame count shown on it]
+    tiles: dict[str, list[Any]] = {}
+    subs: list[Any] = []
+    # topic -> (count at the last window, Hz measured over that window)
+    rates: dict[str, tuple[int, float]] = {}
+    rate_window = time.time()
+    logged = time.time()
+    known: set[str] = set()
 
-    def add_tile(topic):
+    def add_tile(topic: str) -> None:
+        """Add a label for a newly discovered camera topic.
+
+        Args:
+        ----
+            topic: The image topic to show.
+
+        """
         label = QLabel("waiting...")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet("background:#111; color:#888;")
@@ -363,27 +476,31 @@ def cmd_view(args):
         tiles[topic] = [label, -1]
         print(f"discovered {topic}", flush=True)
 
-    def tick():
+    def tick() -> None:
+        """Discover new topics, then refresh the tiles that have a newer frame."""
+        # These are the enclosing scope's window markers, and tick() advances both.
+        nonlocal rate_window, logged
+
         # Discovery runs continuously: the fleet may be respawned under us.
         for name, types in node.get_topic_names_and_types():
             if "sensor_msgs/msg/Image" in types and name not in known:
                 known.add(name)
                 counts[name] = 0
-                subs.append(node.create_subscription(
-                    Image, name, (lambda t: (lambda m: on_image(t, m)))(name),
-                    qos_profile_sensor_data))
+                subs.append(
+                    node.create_subscription(Image, name, functools.partial(on_image, name), qos_profile_sensor_data)
+                )
                 add_tile(name)
 
         now = time.time()
-        if now - state["fps_t"] >= 1.0:
+        if now - rate_window >= 1.0:
             # Rate from frame deltas, not timer ticks: the timer runs at 10 Hz here, so
-            # counting it would misreport anything faster. What the next pass subtracts is
+            # counting it would misreport anything faster. What the next window subtracts is
             # the stored count, so the count is what has to be stored.
-            dt = now - state["fps_t"]
+            dt = now - rate_window
             for t, c in counts.items():
-                prev = state["fps"].get(t, (c, 0.0))[0]
-                state["fps"][t] = (c, (c - prev) / dt)
-            state["fps_t"] = now
+                prev = rates.get(t, (c, 0.0))[0]
+                rates[t] = (c, (c - prev) / dt)
+            rate_window = now
 
         for topic, tile in list(tiles.items()):
             msg = latest.get(topic)
@@ -391,28 +508,37 @@ def cmd_view(args):
                 continue
             if counts[topic] != tile[1]:
                 tile[1] = counts[topic]
-                fps = state["fps"].get(topic, (0, 0.0))[1]
+                fps = rates.get(topic, (0, 0.0))[1]
                 short = topic.strip("/").split("/")[0]
                 # Tile is already the frame's own size, so this is 1:1 on the screen grid.
-                tile[0].setPixmap(QPixmap.fromImage(to_qimage(
-                    msg, f"{short}  {fps:.1f} fps  {msg.width}x{msg.height}")))
+                tile[0].setPixmap(
+                    QPixmap.fromImage(to_qimage(msg, f"{short}  {fps:.1f} fps  {msg.width}x{msg.height}"))
+                )
 
-        if time.time() - state["logged"] >= 1.0:
-            state["logged"] = time.time()
+        if time.time() - logged >= 1.0:
+            logged = time.time()
             if tiles:
-                print("  " + " | ".join(
-                    f"{t.strip('/').split('/')[0]}:{state['fps'].get(t, (0, 0.0))[1]:.1f}Hz"
-                    for t in tiles), flush=True)
+                print(
+                    "  " + " | ".join(f"{t.strip('/').split('/')[0]}:{rates.get(t, (0, 0.0))[1]:.1f}Hz" for t in tiles),
+                    flush=True,
+                )
 
     timer = QTimer()
     timer.timeout.connect(tick)
     timer.start(100)
 
-    def on_key(event):
+    def on_key(event: Any) -> None:
+        """Quit on q or Escape.
+
+        Args:
+        ----
+            event: The key event.
+
+        """
         if event.key() in (Qt.Key.Key_Q, Qt.Key.Key_Escape):
             app.quit()
-    win.keyPressEvent = on_key
 
+    win.keyPressEvent = on_key
     win.showFullScreen()
     app.exec()
     rclpy.shutdown()
@@ -421,8 +547,19 @@ def cmd_view(args):
 
 # -------------------------------------------------------------------------- status
 
-def cmd_status(args):
-    """What is publishing right now, and at what rate."""
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Report what is publishing right now, and at what rate.
+
+    Args:
+    ----
+        args: Parsed command line, holding the measurement window in seconds.
+
+    Returns:
+    -------
+        Zero if any frames arrived, one otherwise.
+
+    """
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
@@ -430,8 +567,20 @@ def cmd_status(args):
 
     rclpy.init()
     node = Node("pterosim_camera_status")
-    seen = {}
-    subs = []
+    # topic -> [(arrival time, width, height), ...]
+    seen: dict[str, list[tuple[float, int, int]]] = {}
+    subs: list[Any] = []
+
+    def on_image(topic: str, msg: Any) -> None:
+        """Record a frame's arrival time and size.
+
+        Args:
+        ----
+            topic: Topic the frame arrived on.
+            msg: The image message.
+
+        """
+        seen.setdefault(topic, []).append((time.time(), msg.width, msg.height))
 
     end = time.time() + args.seconds
     while time.time() < end:
@@ -439,19 +588,18 @@ def cmd_status(args):
 
     for name, types in node.get_topic_names_and_types():
         if "sensor_msgs/msg/Image" in types:
-            subs.append(node.create_subscription(
-                Image, name, (lambda t: (lambda m: seen.setdefault(
-                    t, []).append((time.time(), m.width, m.height))))(name),
-                qos_profile_sensor_data))
+            subs.append(
+                node.create_subscription(Image, name, functools.partial(on_image, name), qos_profile_sensor_data)
+            )
 
     if not subs:
         print("no sensor_msgs/msg/Image topics on the bus -- is the bridge running?")
         rclpy.shutdown()
         return 1
 
+    # Measure over a clean window, after discovery has settled.
     seen.clear()
-    t0 = time.time()
-    end = t0 + args.seconds
+    end = time.time() + args.seconds
     while time.time() < end:
         rclpy.spin_once(node, timeout_sec=0.02)
 
@@ -471,22 +619,26 @@ def cmd_status(args):
 
 # ---------------------------------------------------------------------------- main
 
-def main():
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+def main() -> int:
+    """Parse the command line and run the requested subcommand.
+
+    Returns
+    -------
+        The subcommand's exit status.
+
+    """
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("setup", help="spawn the fleet and point the cameras here")
     s.add_argument("--count", type=int, default=4)
     s.add_argument("--aircraft", default="x500")
-    s.add_argument("--camera", default="gimbal_camera",
-                   help="preferred camera; falls back to any camera aboard")
-    s.add_argument("--tile", default=DEFAULT_TILE,
-                   help="camera resolution and window tile, e.g. 768x480")
+    s.add_argument("--camera", default="gimbal_camera", help="preferred camera; falls back to any camera aboard")
+    s.add_argument("--tile", default=DEFAULT_TILE, help="camera resolution and window tile, e.g. 768x480")
     s.add_argument("--fps", type=float, default=30.0)
     s.add_argument("--base-port", type=int, default=5600)
-    s.add_argument("--host", default=None,
-                   help="address the cameras stream to; auto-detected by default")
+    s.add_argument("--host", default=None, help="address the cameras stream to; auto-detected by default")
     s.add_argument("--address", default=GRPC_ADDRESS, help="PteroSim gRPC host:port")
     s.set_defaults(func=cmd_setup)
 
@@ -497,7 +649,6 @@ def main():
 
     s = sub.add_parser("view", help="fullscreen tiled window")
     s.add_argument("--tile", default=DEFAULT_TILE)
-    s.add_argument("--rows", type=int, default=2)
     s.set_defaults(func=cmd_view)
 
     s = sub.add_parser("status", help="what is publishing, and at what rate")
@@ -507,7 +658,7 @@ def main():
     args = p.parse_args()
     if args.cmd in ("bridge", "view", "status"):
         ensure_ros()
-    return args.func(args)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":
