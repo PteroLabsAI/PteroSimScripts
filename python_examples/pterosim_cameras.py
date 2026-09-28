@@ -190,6 +190,35 @@ def parse_tile(text: str) -> tuple[int, int]:
     return int(w), int(h)
 
 
+def parse_layout(text: str) -> list[tuple[float, float, float]]:
+    """Parse a hand-placed formation: semicolon-separated x,y,yaw triples in degrees.
+
+    This is the escape hatch from the generated formations -- whatever arrangement was set up
+    by hand can be written down once and replayed exactly.
+
+    Args:
+    ----
+        text: Triples such as "-492.2,-199.8,54; -290.3,-198.8,153".
+
+    Returns:
+    -------
+        One (x, y, yaw) per aircraft.
+
+    """
+    out: list[tuple[float, float, float]] = []
+    for part in text.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        fields = part.split(",")
+        if len(fields) != 3:
+            raise ValueError(f"layout entry {part!r} needs x,y,yaw")
+        out.append((float(fields[0]), float(fields[1]), float(fields[2])))
+    if not out:
+        raise ValueError("layout is empty")
+    return out
+
+
 def ensure_ros() -> None:
     """Re-exec under a sourced ROS 2 environment if rclpy is not importable yet.
 
@@ -270,13 +299,23 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # down a line, where the trailing cameras would only ever see the leader's tail.
         corner = args.spacing / math.sqrt(2.0)
         quadrants = ((1, -1), (-1, -1), (-1, 1), (1, 1))
+        poses = (
+            parse_layout(args.layout)
+            if args.layout
+            else [
+                (
+                    quadrants[n % 4][0] * corner,
+                    quadrants[n % 4][1] * corner,
+                    # atan2 of the vector to the origin is the heading that faces the centre.
+                    math.degrees(math.atan2(-quadrants[n % 4][1] * corner, -quadrants[n % 4][0] * corner)),
+                )
+                for n in range(args.count)
+            ]
+        )
         while len(have) < args.count:
             n = len(have)
-            sx, sy = quadrants[n % 4]
-            px, py = sx * corner, sy * corner
-            # atan2 of the vector to the origin is the heading that points at the centre.
-            yaw = math.degrees(math.atan2(-py, -px))
-            drone = sim.spawn(args.aircraft, x=px, y=py, z=30.0, yaw=yaw)
+            px, py, yaw = poses[n]
+            drone = sim.spawn(args.aircraft, x=px, y=py, z=args.alt, yaw=yaw)
             print(
                 f"spawned {args.aircraft} instance_id={drone.instance_id} at ({px:+.1f}, {py:+.1f}) yaw {yaw:+.0f} deg"
             )
@@ -588,6 +627,12 @@ def main() -> int:
     s.add_argument("--address", default=GRPC_ADDRESS, help="PteroSim gRPC host:port")
     s.add_argument(
         "--spacing", type=float, default=25.0, help="distance from the square's centre to each aircraft, in metres"
+    )
+    s.add_argument("--alt", type=float, default=30.0, help="spawn altitude, in metres")
+    s.add_argument(
+        "--layout",
+        default=None,
+        help="hand-placed formation as x,y,yaw triples, e.g. '-10,-10,45; 10,-10,-45'",
     )
     s.add_argument("--respawn", action="store_true", help="remove existing aircraft first, to pick up a new formation")
     s.set_defaults(func=cmd_setup)
