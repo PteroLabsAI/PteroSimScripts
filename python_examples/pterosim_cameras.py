@@ -15,6 +15,15 @@ machine. `bridge` decodes those streams and publishes one Image topic per aircra
 `foxglove` runs foxglove_bridge so the Foxglove client can connect to ws://localhost:8765.
 `status` reports the frame rate on each topic.
 
+WHICH MACHINE RUNS WHICH STEP
+
+`setup` talks to the simulator over gRPC, and the simulator binds that server to 127.0.0.1
+only, so `setup` has to run where PteroSim runs. `bridge` does not: it only reads the RTP
+streams the simulator pushes at it, so it runs anywhere ROS 2 is -- in this setup that means
+`setup` on Windows, `bridge` in WSL. The two share a manifest: `setup` writes it next to the
+user's home, and WSL reaches it as /mnt/c/Users/<you>/camera_fleet.json, so `bridge` there
+needs --manifest pointed at that path.
+
 Foxglove needs no image transcoding: its Image panel subscribes to a
 sensor_msgs/msg/Image topic directly, and the rgb8 frames published here are exactly that.
 python_examples/pterosim_cameras_foxglove.json is a ready 2x2 layout for four aircraft --
@@ -67,7 +76,11 @@ from typing import Any
 
 DEFAULT_TILE = "768x480"
 MANIFEST = str(Path.home() / "camera_fleet.json")
-GRPC_ADDRESS = "172.26.48.1:10011"
+# The simulator binds its scripting server to loopback only -- PteroSimScripting's
+# GrpcServer.cpp hardcodes 127.0.0.1, and the port defaults to 10010. So `setup` has to run on
+# the same machine as PteroSim, which for this setup is Windows. `bridge` is unaffected: it
+# only reads the RTP streams the simulator pushes, so it stays in WSL next to ROS 2.
+GRPC_ADDRESS = "127.0.0.1:10010"
 FOXGLOVE_URL = "ws://localhost:8765"
 
 
@@ -504,7 +517,7 @@ def main() -> int:
     s.add_argument("--count", type=int, default=4)
     s.add_argument("--aircraft", default="x500")
     s.add_argument("--camera", default="gimbal_camera", help="preferred camera; falls back to any camera aboard")
-    s.add_argument("--tile", default=DEFAULT_TILE, help="camera resolution and window tile, e.g. 768x480")
+    s.add_argument("--tile", default=DEFAULT_TILE, help="camera resolution, e.g. 768x480")
     s.add_argument("--fps", type=float, default=30.0)
     s.add_argument("--base-port", type=int, default=5600)
     s.add_argument("--host", default=None, help="address the cameras stream to; auto-detected by default")
