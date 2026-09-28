@@ -66,6 +66,7 @@ Requires: ROS 2 (rclpy, sensor_msgs), PyAV, and the PteroSim SDK for `setup`. `b
 import argparse
 import functools
 import json
+import math
 import os
 import sys
 import tempfile
@@ -256,10 +257,29 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
         have = sorted(a.instance_id for a in sim.aircraft_status())
         print(f"aircraft in the scene: {have or 'none'}")
+
+        if args.respawn and have:
+            # The SDK only takes a pose at spawn time, so a new formation means new aircraft.
+            for i in have:
+                print(f"removing instance {i} for a new formation")
+                sim.get_aircraft(i).remove()
+            have = []
+
+        # A square with every aircraft facing the middle. For four cameras this is the layout
+        # that shows the most: each one looks across the centre at the other three instead of
+        # down a line, where the trailing cameras would only ever see the leader's tail.
+        corner = args.spacing / math.sqrt(2.0)
+        quadrants = ((1, -1), (-1, -1), (-1, 1), (1, 1))
         while len(have) < args.count:
             n = len(have)
-            drone = sim.spawn(args.aircraft, x=-492.0 + 8.0 * n, y=-199.0, z=30.0, yaw=0.0)
-            print(f"spawned {args.aircraft} instance_id={drone.instance_id}")
+            sx, sy = quadrants[n % 4]
+            px, py = sx * corner, sy * corner
+            # atan2 of the vector to the origin is the heading that points at the centre.
+            yaw = math.degrees(math.atan2(-py, -px))
+            drone = sim.spawn(args.aircraft, x=px, y=py, z=30.0, yaw=yaw)
+            print(
+                f"spawned {args.aircraft} instance_id={drone.instance_id} at ({px:+.1f}, {py:+.1f}) yaw {yaw:+.0f} deg"
+            )
             have = sorted(set(have) | {drone.instance_id})
         have = have[: args.count]
 
@@ -566,6 +586,10 @@ def main() -> int:
     s.add_argument("--base-port", type=int, default=5600)
     s.add_argument("--host", default=None, help="address the cameras stream to; auto-detected by default")
     s.add_argument("--address", default=GRPC_ADDRESS, help="PteroSim gRPC host:port")
+    s.add_argument(
+        "--spacing", type=float, default=25.0, help="distance from the square's centre to each aircraft, in metres"
+    )
+    s.add_argument("--respawn", action="store_true", help="remove existing aircraft first, to pick up a new formation")
     s.set_defaults(func=cmd_setup)
 
     s = sub.add_parser("bridge", help="publish the streams as Image topics")
