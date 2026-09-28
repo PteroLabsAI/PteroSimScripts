@@ -76,6 +76,8 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_TILE = "768x480"
+# A hand-placed formation is given as x,y,yaw triples.
+LAYOUT_FIELDS = 3
 MANIFEST = str(Path.home() / "camera_fleet.json")
 # The simulator binds its scripting server to loopback only -- PteroSimScripting's
 # GrpcServer.cpp hardcodes 127.0.0.1, and the port defaults to 10010. So `setup` has to run on
@@ -206,13 +208,13 @@ def parse_layout(text: str) -> list[tuple[float, float, float]]:
 
     """
     out: list[tuple[float, float, float]] = []
-    for part in text.split(";"):
-        part = part.strip()
-        if not part:
+    for raw in text.split(";"):
+        entry = raw.strip()
+        if not entry:
             continue
-        fields = part.split(",")
-        if len(fields) != 3:
-            raise ValueError(f"layout entry {part!r} needs x,y,yaw")
+        fields = entry.split(",")
+        if len(fields) != LAYOUT_FIELDS:
+            raise ValueError(f"layout entry {entry!r} needs x,y,yaw")
         out.append((float(fields[0]), float(fields[1]), float(fields[2])))
     if not out:
         raise ValueError("layout is empty")
