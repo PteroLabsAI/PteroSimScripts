@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""PteroSim drone cameras -> ROS 2, in one file.
+"""PteroSim drone cameras -> ROS 2 -> Foxglove, in one file.
 
-Publishes each aircraft's camera to ROS 2 as sensor_msgs/msg/Image and shows them tiled
-fullscreen. Three steps, because the simulator only accepts sensor settings while it is
-stopped:
+Publishes each aircraft's camera to ROS 2 as sensor_msgs/msg/Image. Viewing is left to
+Foxglove, so there is no viewer here. Four steps, because the simulator only accepts sensor
+settings while it is stopped:
 
     pterosim_cameras.py setup     spawn the fleet, point the cameras at this machine
     pterosim_cameras.py bridge    decode the streams and publish them as Image topics
-    pterosim_cameras.py view      fullscreen 2x2 window
-    pterosim_cameras.py all       all three, in that order
+    pterosim_cameras.py foxglove  serve those topics to Foxglove over a WebSocket
     pterosim_cameras.py status    what is publishing, and at what rate
 
 `setup` puts four x500 in the scene and streams each gimbal_camera over RTP/H.264 to this
-machine. `bridge` decodes those streams and publishes one topic per aircraft. `view` shows
-them. `all` is the whole thing.
+machine. `bridge` decodes those streams and publishes one Image topic per aircraft.
+`foxglove` runs foxglove_bridge so the Foxglove client can connect to ws://localhost:8765.
+`status` reports the frame rate on each topic.
+
+Foxglove needs no image transcoding: its Image panel subscribes to a
+sensor_msgs/msg/Image topic directly, and the rgb8 frames published here are exactly that.
+python_examples/pterosim_cameras_foxglove.json is a ready 2x2 layout for four aircraft --
+import it in Foxglove instead of arranging the panels by hand.
 
 WHY IT LOOKS THE WAY IT DOES
 
@@ -37,13 +42,16 @@ Two details that are easy to get wrong:
     its own, ffmpeg takes such a description only from a file, and without the whitelist it
     cannot open the nested rtp/udp stream at all.
 
-The cameras are configured for 768x480 because four of them tile a 1536x960 screen exactly.
---tile changes both the camera resolution and the window layout together.
+The cameras are configured for 768x480, which is half a 1536x960 screen in each direction, so
+four of them tile it in the 2x2 Foxglove layout with no scaling. --tile changes the camera
+resolution, and the layout's panels to match.
 
     4 x 768x480 at 30 fps source, ~20 Hz per stream delivered on one decode process.
 
-Requires: ROS 2 (rclpy, sensor_msgs), PyAV, and the PteroSim SDK for `setup`. Run `bridge`
-under a virtualenv that has PyAV; run `view` under one that has PySide6.
+Requires: ROS 2 (rclpy, sensor_msgs), PyAV, and the PteroSim SDK for `setup`. `bridge` and
+`status` need PyAV; `foxglove` needs the foxglove_bridge package:
+
+    sudo apt install ros-jazzy-foxglove-bridge
 """
 
 import argparse
@@ -60,7 +68,7 @@ from typing import Any
 DEFAULT_TILE = "768x480"
 MANIFEST = str(Path.home() / "camera_fleet.json")
 GRPC_ADDRESS = "172.26.48.1:10011"
-COLS = 2
+FOXGLOVE_URL = "ws://localhost:8765"
 
 
 # --------------------------------------------------------------------------- shared
@@ -363,186 +371,47 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----------------------------------------------------------------------------- view
+# --------------------------------------------------------------------------- foxglove
 
 
-def cmd_view(args: argparse.Namespace) -> int:
-    """Show every camera topic on the bus in one fullscreen tiled window.
+def cmd_foxglove(args: argparse.Namespace) -> int:
+    """Serve the camera topics to a Foxglove client over a WebSocket.
+
+    Runs the foxglove_bridge package the same way the ROSCon PX4 workshop does: the client
+    connects as a Foxglove WebSocket, not over DDS, which is what makes it reachable from a
+    host that is not on the same ROS 2 network.
 
     Args:
     ----
-        args: Parsed command line, holding the tile size.
+        args: Parsed command line, holding the port and the topic whitelist.
 
     Returns:
     -------
-        Zero on success.
+        The bridge's exit status.
 
     """
-    import numpy as np
-    import rclpy
-    from PySide6.QtCore import QRect, Qt, QTimer
-    from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
-    from PySide6.QtWidgets import QApplication, QGridLayout, QLabel, QWidget
-    from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import Image
+    import shutil
+    import subprocess
 
-    width, height = parse_tile(args.tile)
+    if shutil.which("foxglove_bridge") is None:
+        print(
+            "foxglove_bridge is not on PATH.\n" "Install it with:\n" "  sudo apt install ros-jazzy-foxglove-bridge",
+            file=sys.stderr,
+        )
+        return 1
 
-    def to_qimage(msg: Any, caption: str = "") -> Any:
-        """Convert an rgb8 Image into a QImage, copied, with a caption painted in.
-
-        The numpy array is a view onto msg.data, which the next message replaces, so handing
-        it to QImage uncopied would show torn frames. The caption goes into the image rather
-        than the layout: a layout label would shrink the tile, and the tiles are sized to
-        cover the screen exactly.
-
-        Args:
-        ----
-            msg: The image message.
-            caption: Text drawn into the top-left corner, if any.
-
-        Returns:
-        -------
-            A QImage that owns its own pixel data.
-
-        """
-        h, w = int(msg.height), int(msg.width)
-        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, msg.step // 3, 3)[:, :w, :3]
-        img = QImage(arr.tobytes(), w, h, msg.step, QImage.Format.Format_RGB888).copy()
-        if caption:
-            p = QPainter(img)
-            p.setFont(QFont("", 13, QFont.Weight.Bold))
-            wpx = 12 + 8 * len(caption)
-            p.fillRect(0, 0, wpx, 22, QColor(0, 0, 0, 130))
-            p.setPen(QColor(255, 255, 255))
-            p.drawText(QRect(6, 3, wpx, 18), Qt.AlignmentFlag.AlignLeft, caption)
-            p.end()
-        return img
-
-    rclpy.init()
-    node = Node("pterosim_camera_view")
-    latest: dict[str, Any] = {}
-    counts: dict[str, int] = {}
-
-    def on_image(topic: str, msg: Any) -> None:
-        """Record the newest frame for a topic.
-
-        Args:
-        ----
-            topic: Topic the frame arrived on.
-            msg: The image message.
-
-        """
-        latest[topic] = msg
-        counts[topic] += 1
-
-    # Reception on its own thread: sensor-data QoS is best effort with a shallow queue, so a
-    # consumer sharing the Qt event loop would simply lose frames.
-    threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
-
-    app = QApplication(sys.argv)
-    win = QWidget()
-    win.setWindowTitle("PteroSim cameras (ROS 2)")
-    grid = QGridLayout(win)
-    # Nothing between the tiles: the grid is the screen, so any margin or caption row would
-    # leave the fleet not quite filling it.
-    grid.setContentsMargins(0, 0, 0, 0)
-    grid.setSpacing(0)
-
-    # topic -> [image label, last frame count shown on it]
-    tiles: dict[str, list[Any]] = {}
-    subs: list[Any] = []
-    # topic -> (count at the last window, Hz measured over that window)
-    rates: dict[str, tuple[int, float]] = {}
-    rate_window = time.time()
-    logged = time.time()
-    known: set[str] = set()
-
-    def add_tile(topic: str) -> None:
-        """Add a label for a newly discovered camera topic.
-
-        Args:
-        ----
-            topic: The image topic to show.
-
-        """
-        label = QLabel("waiting...")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("background:#111; color:#888;")
-        label.setFixedSize(width, height)
-        n = len(tiles)
-        grid.addWidget(label, n // COLS, n % COLS)
-        tiles[topic] = [label, -1]
-        print(f"discovered {topic}", flush=True)
-
-    def tick() -> None:
-        """Discover new topics, then refresh the tiles that have a newer frame."""
-        # These are the enclosing scope's window markers, and tick() advances both.
-        nonlocal rate_window, logged
-
-        # Discovery runs continuously: the fleet may be respawned under us.
-        for name, types in node.get_topic_names_and_types():
-            if "sensor_msgs/msg/Image" in types and name not in known:
-                known.add(name)
-                counts[name] = 0
-                subs.append(
-                    node.create_subscription(Image, name, functools.partial(on_image, name), qos_profile_sensor_data)
-                )
-                add_tile(name)
-
-        now = time.time()
-        if now - rate_window >= 1.0:
-            # Rate from frame deltas, not timer ticks: the timer runs at 10 Hz here, so
-            # counting it would misreport anything faster. What the next window subtracts is
-            # the stored count, so the count is what has to be stored.
-            dt = now - rate_window
-            for t, c in counts.items():
-                prev = rates.get(t, (c, 0.0))[0]
-                rates[t] = (c, (c - prev) / dt)
-            rate_window = now
-
-        for topic, tile in list(tiles.items()):
-            msg = latest.get(topic)
-            if msg is None:
-                continue
-            if counts[topic] != tile[1]:
-                tile[1] = counts[topic]
-                fps = rates.get(topic, (0, 0.0))[1]
-                short = topic.strip("/").split("/")[0]
-                # Tile is already the frame's own size, so this is 1:1 on the screen grid.
-                tile[0].setPixmap(
-                    QPixmap.fromImage(to_qimage(msg, f"{short}  {fps:.1f} fps  {msg.width}x{msg.height}"))
-                )
-
-        if time.time() - logged >= 1.0:
-            logged = time.time()
-            if tiles:
-                print(
-                    "  " + " | ".join(f"{t.strip('/').split('/')[0]}:{rates.get(t, (0, 0.0))[1]:.1f}Hz" for t in tiles),
-                    flush=True,
-                )
-
-    timer = QTimer()
-    timer.timeout.connect(tick)
-    timer.start(100)
-
-    def on_key(event: Any) -> None:
-        """Quit on q or Escape.
-
-        Args:
-        ----
-            event: The key event.
-
-        """
-        if event.key() in (Qt.Key.Key_Q, Qt.Key.Key_Escape):
-            app.quit()
-
-    win.keyPressEvent = on_key
-    win.showFullScreen()
-    app.exec()
-    rclpy.shutdown()
-    return 0
+    # Restricting the whitelist keeps four 768x480 image topics from being joined by whatever
+    # else is on the bus, which is what makes the bridge fall over on a busy graph.
+    cmd = ["foxglove_bridge", "--port", str(args.port), "--topics", args.topics]
+    print(f"serving {args.topics} on {FOXGLOVE_URL}")
+    print(
+        "in Foxglove: connect with 'Foxglove WebSocket' and that URL, then open "
+        "python_examples/pterosim_cameras_foxglove.json"
+    )
+    try:
+        return subprocess.run(cmd, check=False).returncode
+    except KeyboardInterrupt:
+        return 0
 
 
 # -------------------------------------------------------------------------- status
@@ -647,9 +516,10 @@ def main() -> int:
     s.add_argument("--report", type=float, default=10.0)
     s.set_defaults(func=cmd_bridge)
 
-    s = sub.add_parser("view", help="fullscreen tiled window")
-    s.add_argument("--tile", default=DEFAULT_TILE)
-    s.set_defaults(func=cmd_view)
+    s = sub.add_parser("foxglove", help="serve the camera topics to Foxglove")
+    s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--topics", default="/x500_[0-9]+/.*image_raw", help="topic whitelist for the bridge")
+    s.set_defaults(func=cmd_foxglove)
 
     s = sub.add_parser("status", help="what is publishing, and at what rate")
     s.add_argument("--seconds", type=float, default=10.0)
