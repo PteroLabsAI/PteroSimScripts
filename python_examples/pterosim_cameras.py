@@ -156,7 +156,21 @@ def open_stream(host: str, port: int) -> Any:
     """
     import av
 
-    return av.open(str(write_sdp(host, port)), format="sdp", options={"protocol_whitelist": "file,rtp,udp"})
+    # Four decoders share this machine, and ffmpeg defaults each one to as many threads as it
+    # sees cores -- on a 16-core box that is 64 threads for 768x480, which spends its time
+    # context switching. Two per stream is enough to keep up. The rest ask the decoder not to
+    # buffer or reorder: a live preview is worth more than a frame-perfect order.
+    return av.open(
+        str(write_sdp(host, port)),
+        format="sdp",
+        options={
+            "protocol_whitelist": "file,rtp,udp",
+            "threads": "2",
+            "fflags": "nobuffer",
+            "flags": "low_delay",
+            "reorder_queue_size": "0",
+        },
+    )
 
 
 def parse_tile(text: str) -> tuple[int, int]:
@@ -340,7 +354,11 @@ def cmd_bridge(args: argparse.Namespace) -> int:
                     msg.encoding = "rgb8"
                     msg.is_bigendian = 0
                     msg.step = int(frame.width) * 3
-                    msg.data = frame.to_ndarray(format="rgb24").tobytes()
+                    # Hand the buffer over as a flat view rather than tobytes(). Image.data
+                    # copies into an array.array either way, so tobytes() would add a second
+                    # full copy of every frame -- 1.1 MB each, four streams at 20 Hz is ~90 MB/s
+                    # of pure memcpy. to_ndarray() is C-contiguous, so reshape(-1) is a view.
+                    msg.data = frame.to_ndarray(format="rgb24").reshape(-1)
                     self.pub.publish(msg)
                     self.frames += 1
             except Exception as exc:
@@ -406,16 +424,42 @@ def cmd_foxglove(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
 
-    if shutil.which("foxglove_bridge") is None:
+    if shutil.which("ros2") is None:
         print(
-            "foxglove_bridge is not on PATH.\n" "Install it with:\n" "  sudo apt install ros-jazzy-foxglove-bridge",
+            "ros2 is not on PATH; source /opt/ros/<distro>/setup.bash first",
+            file=sys.stderr,
+        )
+        return 1
+
+    # ament installs the binary into lib/<package>/, which it does not add to PATH, so
+    # `ros2 run` is the only portable way to reach it.
+    probe = subprocess.run(
+        ["ros2", "pkg", "executables", "foxglove_bridge"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if "foxglove_bridge" not in probe.stdout:
+        print(
+            "the foxglove_bridge package is not installed.\n"
+            "Install it with:\n"
+            "  sudo apt install ros-jazzy-foxglove-bridge",
             file=sys.stderr,
         )
         return 1
 
     # Restricting the whitelist keeps four 768x480 image topics from being joined by whatever
     # else is on the bus, which is what makes the bridge fall over on a busy graph.
-    cmd = ["foxglove_bridge", "--port", str(args.port), "--topics", args.topics]
+    cmd = [
+        "ros2",
+        "run",
+        "foxglove_bridge",
+        "foxglove_bridge",
+        "--port",
+        str(args.port),
+        "--topics",
+        args.topics,
+    ]
     print(f"serving {args.topics} on {FOXGLOVE_URL}")
     print(
         "in Foxglove: connect with 'Foxglove WebSocket' and that URL, then open "
