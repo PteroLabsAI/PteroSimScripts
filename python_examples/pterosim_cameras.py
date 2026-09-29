@@ -1,43 +1,47 @@
 #!/usr/bin/env python3
 """PteroSim drone cameras -> ROS 2 -> Foxglove, in one file.
 
-Publishes each aircraft's camera to ROS 2 as sensor_msgs/msg/Image. Viewing is left to
-Foxglove, so there is no viewer here. Four steps, because the simulator only accepts sensor
-settings while it is stopped:
+Flies a ring of aircraft around its own centre with every nose on that centre, and publishes each
+aircraft's gimbal camera to ROS 2 as foxglove_msgs/msg/CompressedVideo, with the fleet's poses on
+/tf. Viewing is left to Foxglove, so there is no viewer here. The steps:
 
-    pterosim_cameras.py setup     spawn the fleet, point the cameras at this machine
-    pterosim_cameras.py bridge    decode the streams and publish them as Image topics
+    pterosim_cameras.py setup     spawn the ring, point the cameras at this machine, start
+    pterosim_cameras.py fly       one PX4 SITL per aircraft: take off, orbit; Ctrl+C lands
+    pterosim_cameras.py bridge    publish the streams and the poses to ROS 2
     pterosim_cameras.py foxglove  serve those topics to Foxglove over a WebSocket
     pterosim_cameras.py status    what is publishing, and at what rate
 
-`setup` puts four x500 in the scene and streams each gimbal_camera over RTP/H.264 to this
-machine. `bridge` decodes those streams and publishes one Image topic per aircraft.
-`foxglove` runs foxglove_bridge so the Foxglove client can connect to ws://localhost:8765.
-`status` reports the frame rate on each topic.
+`setup` puts four x500 on a circle, each facing its centre, and streams every gimbal_camera over
+RTP/H.264 to this machine; the simulator only accepts sensor settings while it is stopped, which
+is why this is a step of its own. `fly` starts one PX4 SITL per aircraft, takes the fleet off and
+orbits the circle's centre with every nose held on it: aircraft on one circle at one speed keep
+their spacing, so each camera keeps the others in view. `bridge` forwards the H.264 frames
+undecoded and publishes the simulator's pose of every aircraft as map -> x500_<id>/base_link.
 
 WHICH MACHINE RUNS WHICH STEP
 
-`setup` talks to the simulator over gRPC, and the simulator binds that server to 127.0.0.1
-only, so `setup` has to run where PteroSim runs. `bridge` does not: it only reads the RTP
-streams the simulator pushes at it, so it runs anywhere ROS 2 is -- in this setup that means
-`setup` on Windows, `bridge` in WSL. The two share a manifest: `setup` writes it next to the
-user's home, and WSL reaches it as /mnt/c/Users/<you>/camera_fleet.json, so `bridge` there
-needs --manifest pointed at that path.
+`setup` talks to the simulator over gRPC, and the simulator binds that server to 127.0.0.1, so
+`setup` runs where PteroSim runs. The other steps run in WSL next to ROS 2 and PX4; with mirrored
+networking WSL reaches that loopback too, which is how `bridge` reads the poses. The steps share a
+manifest: `setup` writes it next to the user's home, and WSL reaches it as
+/mnt/c/Users/<you>/camera_fleet.json, so the steps there need --manifest pointed at that path.
 
-Foxglove needs no image transcoding: its Image panel subscribes to a
-sensor_msgs/msg/Image topic directly, and the rgb8 frames published here are exactly that.
-python_examples/pterosim_cameras_foxglove.json is a ready 2x2 layout for four aircraft --
-import it in Foxglove instead of arranging the panels by hand.
+Under mirrored WSL networking FastDDS, ROS 2's default, does not discover a second process, so the
+ROS steps here run on CycloneDDS. Any other node that should see these topics needs
+RMW_IMPLEMENTATION=rmw_cyclonedds_cpp too. From Windows, connect Foxglove to ws://127.0.0.1:8765:
+localhost resolves to ::1 first, which mirrored WSL does not forward.
+python_examples/pterosim_cameras_foxglove.json is a ready layout -- the four cameras and a 3D view
+of the fleet -- import it in Foxglove instead of arranging the panels by hand.
 
 WHY IT LOOKS THE WAY IT DOES
 
 The simulator already has a camera pipeline: its own encoder sends RTP/H.264 to
 udp://<host>:<stream_port + instance_id>, the same stream a ground station displays. This
 consumes that stream instead of pulling frames over gRPC, which is what
-PteroSimScripting/python_examples/drone_camera_display.py does. That matters: a gRPC pull is
-a synchronous GPU readback on the sim's render path, and one at four aircraft and ~10 Hz each
--- roughly 37 MB/s -- is enough to take PteroSim down. Decoding a push stream touches nothing
-in the simulator, so there is no such ceiling.
+python_examples/drone_camera_display.py does. That matters: a gRPC pull is a synchronous GPU
+readback on the sim's render path, paid for every frame pulled, while reading a push stream
+touches nothing in the simulator. Nothing is decoded here either: Foxglove decodes
+H.264 itself, so the bridge only moves each access unit into a message.
 
 Two details that are easy to get wrong:
 
@@ -51,19 +55,19 @@ Two details that are easy to get wrong:
     its own, ffmpeg takes such a description only from a file, and without the whitelist it
     cannot open the nested rtp/udp stream at all.
 
-The cameras are configured for 768x480, which is half a 1536x960 screen in each direction, so
-four of them tile it in the 2x2 Foxglove layout with no scaling. --tile changes the camera
-resolution, and the layout's panels to match.
+The cameras are configured for 768x480; --tile changes that.
 
-    4 x 768x480 at 30 fps source, ~20 Hz per stream delivered on one decode process.
+Requires: ROS 2 with foxglove_msgs and rmw_cyclonedds_cpp, PyAV, the PteroSim SDK for `setup` and
+`bridge` ($PTEROSIM_SDK), and for `fly` pymavlink plus a PX4-Autopilot checkout built for
+px4_sitl_default with the vehicle's airframe installed. `foxglove` needs the foxglove_bridge
+package:
 
-Requires: ROS 2 (rclpy, sensor_msgs), PyAV, and the PteroSim SDK for `setup`. `bridge` and
-`status` need PyAV; `foxglove` needs the foxglove_bridge package:
-
-    sudo apt install ros-jazzy-foxglove-bridge
+    sudo apt install ros-$ROS_DISTRO-foxglove-bridge ros-$ROS_DISTRO-foxglove-msgs
+    sudo apt install ros-$ROS_DISTRO-rmw-cyclonedds-cpp
 """
 
 import argparse
+import array
 import functools
 import json
 import math
@@ -78,13 +82,45 @@ from typing import Any
 DEFAULT_TILE = "768x480"
 # A hand-placed formation is given as x,y,yaw triples.
 LAYOUT_FIELDS = 3
+# spawn() takes Unreal units, which are centimetres; every distance on this command line is metres.
+CM_PER_M = 100.0
 MANIFEST = str(Path.home() / "camera_fleet.json")
 # The simulator binds its scripting server to loopback only -- PteroSimScripting's
 # GrpcServer.cpp hardcodes 127.0.0.1, and the port defaults to 10010. So `setup` has to run on
-# the same machine as PteroSim, which for this setup is Windows. `bridge` is unaffected: it
-# only reads the RTP streams the simulator pushes, so it stays in WSL next to ROS 2.
+# the same machine as PteroSim, which for this setup is Windows. Mirrored WSL networking
+# reaches that loopback too, which is how `bridge` reads the poses from WSL.
 GRPC_ADDRESS = "127.0.0.1:10010"
-FOXGLOVE_URL = "ws://localhost:8765"
+# 127.0.0.1, not localhost: from Windows, localhost resolves to ::1 first, which mirrored WSL
+# does not forward, and the WebSocket handshake hangs.
+FOXGLOVE_URL = "ws://127.0.0.1:8765"
+VIDEO_TYPE = "foxglove_msgs/msg/CompressedVideo"
+# FastDDS, ROS 2's default, never discovers a second process under mirrored WSL networking --
+# measured on Humble, while CycloneDDS finds the same peers at once.
+RMW = "rmw_cyclonedds_cpp"
+
+# PX4's onboard link for an API listens on this + instance id (px4-rc.mavlink).
+PX4_API_PORT = 14580
+HIL_BASE_PORT = 4560  # PteroSim's PX4 HIL server listens on this + instance id
+PX4_AIRFRAME = 22100  # the id x500's firmwares/px4_x500 is installed under in the PX4 tree
+GCS_SYSTEM_ID = 245  # a ground station's id, clear of the vehicles' 1..N
+HEARTBEAT_PERIOD_S = 1.0  # PX4 declares a GCS lost after a few silent seconds and will not arm
+POLL_PERIOD_S = 0.01  # chosen, no evidence: fast enough that no link's socket fills
+PX4_BOOT_TIMEOUT_S = 60.0  # boot is a few seconds; chosen, generous
+ARM_TIMEOUT_S = 120.0  # the estimator settles on GPS in ~20 s at 1x; chosen, generous
+ARM_RETRY_S = 2.0  # chosen, no evidence
+TAKEOFF_TIMEOUT_S = 60.0  # a 30 m climb takes ~15 s; chosen, generous
+ACK_TIMEOUT_S = 5.0  # chosen, no evidence
+LAND_TIMEOUT_S = 120.0  # descent plus PX4's auto-disarm on the ground; chosen, generous
+STATUS_PERIOD_S = 10.0  # chosen, no evidence
+ALT_TOLERANCE_M = 1.0  # PX4's takeoff stops a little short of the target; chosen
+MM_PER_M = 1000.0
+DEG_E7 = 1e7  # MAVLink carries latitude and longitude as degrees * 1e7
+EARTH_RADIUS_M = 6_371_000.0  # mean radius (IUGG); metres per degree near the ground is all it is for
+MAV_CMD_DO_ORBIT = 34  # MAVLink common.xml
+ORBIT_YAW_FRONT_TO_CENTRE = 0  # PX4 msg/OrbitStatus.msg HOLD_FRONT_TO_CIRCLE_CENTER
+WORLD_FRAME = "map"
+TF_RATE_HZ = 20.0  # chosen: smooth in a 3D view; each call waits about one simulator frame
+TF_QUEUE_DEPTH = 10  # rclpy's customary history depth
 
 
 # --------------------------------------------------------------------------- shared
@@ -159,21 +195,42 @@ def open_stream(host: str, port: int) -> Any:
     """
     import av
 
-    # Four decoders share this machine, and ffmpeg defaults each one to as many threads as it
-    # sees cores -- on a 16-core box that is 64 threads for 768x480, which spends its time
-    # context switching. Two per stream is enough to keep up. The rest ask the decoder not to
-    # buffer or reorder: a live preview is worth more than a frame-perfect order.
+    # Nothing is decoded here, so no decoder options -- only ask the demuxer not to buffer or
+    # reorder packets: a live preview is worth more than a packet-perfect order.
     return av.open(
         str(write_sdp(host, port)),
         format="sdp",
         options={
             "protocol_whitelist": "file,rtp,udp",
-            "threads": "2",
             "fflags": "nobuffer",
-            "flags": "low_delay",
             "reorder_queue_size": "0",
         },
     )
+
+
+def ring(count: int, radius: float) -> list[tuple[float, float, float]]:
+    """Space aircraft evenly on a circle, every one facing its centre.
+
+    That is the formation that shows the most: each camera looks across the centre at all the
+    others, instead of down a line where the trailing ones would only ever see a tail.
+
+    Args:
+    ----
+        count: How many aircraft.
+        radius: Distance from the centre, in metres.
+
+    Returns:
+    -------
+        One (x, y, yaw) per aircraft, yaw in Unreal's sense: degrees clockwise from +X.
+
+    """
+    out = []
+    for n in range(count):
+        a = math.tau * n / count
+        x, y = radius * math.cos(a), radius * math.sin(a)
+        # atan2 of the vector to the centre is the heading that faces it.
+        out.append((x, y, math.degrees(math.atan2(-y, -x))))
+    return out
 
 
 def parse_tile(text: str) -> tuple[int, int]:
@@ -200,7 +257,7 @@ def parse_layout(text: str) -> list[tuple[float, float, float]]:
 
     Args:
     ----
-        text: Triples such as "-492.2,-199.8,54; -290.3,-198.8,153".
+        text: Triples such as "2.5,0,180; -2.5,0,0".
 
     Returns:
     -------
@@ -219,6 +276,47 @@ def parse_layout(text: str) -> list[tuple[float, float, float]]:
     if not out:
         raise ValueError("layout is empty")
     return out
+
+
+def import_pterosim() -> Any:
+    """Import the PteroSim SDK's client class: from $PTEROSIM_SDK if set, else the installed package.
+
+    Returns
+    -------
+        The PteroSim class.
+
+    """
+    sdk = os.environ.get("PTEROSIM_SDK")
+    if sdk:
+        sys.path.insert(0, sdk)
+    from pterosim import PteroSim
+
+    return PteroSim
+
+
+def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
+    """Quaternion of ROS fixed-axis roll, pitch and yaw.
+
+    Args:
+    ----
+        roll: About X, in radians.
+        pitch: About Y, in radians.
+        yaw: About Z, in radians.
+
+    Returns:
+    -------
+        The quaternion as (x, y, z, w).
+
+    """
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
 
 
 def ensure_ros() -> None:
@@ -267,13 +365,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         Zero on success.
 
     """
-    sdk = os.environ.get("PTEROSIM_SDK", "")
-    if not sdk:
-        default = "/mnt/c/Users/Yollnahkriin/Documents/Unreal_Projects/PteroSim/" "Plugins/PteroSimScripting/SDK/python"
-        sdk = default if Path(default).exists() else ""
-    if sdk:
-        sys.path.insert(0, sdk)
-    from pterosim import PteroSim
+    PteroSim = import_pterosim()
 
     width, height = parse_tile(args.tile)
     host = args.host or local_address()
@@ -296,28 +388,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 sim.get_aircraft(i).remove()
             have = []
 
-        # A square with every aircraft facing the middle. For four cameras this is the layout
-        # that shows the most: each one looks across the centre at the other three instead of
-        # down a line, where the trailing cameras would only ever see the leader's tail.
-        corner = args.spacing / math.sqrt(2.0)
-        quadrants = ((1, -1), (-1, -1), (-1, 1), (1, 1))
-        poses = (
-            parse_layout(args.layout)
-            if args.layout
-            else [
-                (
-                    quadrants[n % 4][0] * corner,
-                    quadrants[n % 4][1] * corner,
-                    # atan2 of the vector to the origin is the heading that faces the centre.
-                    math.degrees(math.atan2(-quadrants[n % 4][1] * corner, -quadrants[n % 4][0] * corner)),
-                )
-                for n in range(args.count)
-            ]
-        )
+        poses = parse_layout(args.layout) if args.layout else ring(args.count, args.spacing)
         while len(have) < args.count:
             n = len(have)
             px, py, yaw = poses[n]
-            drone = sim.spawn(args.aircraft, x=px, y=py, z=args.alt, yaw=yaw)
+            # z is only where the ground trace starts looking from: a spawn always sits on the ground.
+            drone = sim.spawn(args.aircraft, x=px * CM_PER_M, y=py * CM_PER_M, z=0.0, yaw=yaw)
             print(
                 f"spawned {args.aircraft} instance_id={drone.instance_id} at ({px:+.1f}, {py:+.1f}) yaw {yaw:+.0f} deg"
             )
@@ -335,6 +411,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 print(f"  instance {i}: no camera aboard, added {name!r}")
                 cameras = [s for s in drone.list_sensors() if s.type == "camera"]
             cam = next((c for c in cameras if c.name == args.camera), cameras[0])
+            # The mount's zero is level. Taken from the autopilot, it stays there, so the cameras
+            # keep looking at each other rather than wherever the flight controller parks them.
+            drone.set_gimbal_source("api")
 
             # stream_port is per aircraft, so the real port steps by two.
             stream_port = args.base_port + i
@@ -348,7 +427,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 stream_host=host,
             )
             aircraft = getattr(drone, "aircraft_name", None) or args.aircraft
-            topic = f"/{aircraft}_{i}/{cam.name}/image_raw"
+            topic = f"/{aircraft}_{i}/{cam.name}/compressed_video"
             streams.append(
                 {"instance_id": i, "aircraft": aircraft, "camera": cam.name, "port": stream_port + i, "topic": topic}
             )
@@ -364,11 +443,233 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----------------------------------------------------------------------------- fly
+
+
+def launch_px4(px4_root: Path, instance: int, airframe: int) -> Any:
+    """Start one PX4 SITL instance that flies the simulator's aircraft of that instance id.
+
+    Args:
+    ----
+        px4_root: The PX4-Autopilot checkout, built with `make px4_sitl_default`.
+        instance: The aircraft's instance id; PX4 then dials HIL on 4560 + instance.
+        airframe: SYS_AUTOSTART id of the vehicle's PX4 airframe.
+
+    Returns:
+    -------
+        The running process; its console goes to rootfs/<instance>/px4.log.
+
+    """
+    import subprocess
+
+    build = px4_root / "build" / "px4_sitl_default"
+    rootfs = build / "rootfs" / str(instance)
+    rootfs.mkdir(parents=True, exist_ok=True)
+    # A parameter store left by another airframe would leak its gains into this one.
+    for store in ("parameters.bson", "parameters_backup.bson"):
+        (rootfs / store).unlink(missing_ok=True)
+    # No PX4_SIM_MODEL: that selects PX4's own simulators. The simulator is the Windows process,
+    # which mirrored WSL reaches on loopback.
+    env = {k: v for k, v in os.environ.items() if k != "PX4_SIM_MODEL"}
+    env.update(PX4_SIM_HOSTNAME="127.0.0.1", PX4_SYS_AUTOSTART=str(airframe))
+    with (rootfs / "px4.log").open("w") as log:
+        # A session of its own: Ctrl+C in this terminal must reach this script, which lands the
+        # fleet, and not the autopilots, which would quit in the air.
+        return subprocess.Popen(
+            [str(build / "bin" / "px4"), "-i", str(instance), "-d", str(build / "etc")],
+            cwd=rootfs,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+
+def cmd_fly(args: argparse.Namespace) -> int:
+    """Fly the fleet: take off, then orbit the fleet's centre with every nose on that centre.
+
+    Aircraft on one circle at one speed keep their spacing, so with every nose held on the centre
+    each camera keeps the others in view for as long as the orbit runs. Ctrl+C lands.
+
+    Args:
+    ----
+        args: Parsed command line, holding the manifest, the PX4 checkout, altitude and speed.
+
+    Returns:
+    -------
+        Zero once the fleet has landed.
+
+    """
+    from pymavlink import mavutil
+
+    px4_root = Path(args.px4).expanduser()
+    if not list((px4_root / "build/px4_sitl_default/etc/init.d-posix/airframes").glob(f"{args.airframe}_*")):
+        raise SystemExit(
+            f"airframe {args.airframe} is not in {px4_root}/build/px4_sitl_default/etc -- copy the vehicle's "
+            f"firmwares/px4_* there as {args.airframe}_<name>, through `tr -d '\\r'` if it comes from a "
+            "Windows checkout"
+        )
+    ids = [s["instance_id"] for s in json.loads(Path(args.manifest).read_text())["streams"]]
+    procs: dict[int, Any] = {}
+    links: dict[int, Any] = {}
+    next_beat = 0.0
+
+    def pump(seconds: float, done: Any) -> bool:
+        """Keep every link alive and read, until done() holds or the time is up.
+
+        One thread for all links: pymavlink keeps the latest message of each type in
+        link.messages, so reading is all the bookkeeping there is.
+
+        Args:
+        ----
+            seconds: How long to wait at most.
+            done: Predicate checked between reads.
+
+        Returns:
+        -------
+            Whether done() came true in time.
+
+        """
+        nonlocal next_beat
+        end = time.time() + seconds
+        while not done():
+            now = time.time()
+            if now > end:
+                return False
+            for i, proc in procs.items():
+                if proc.poll() is not None:
+                    raise SystemExit(f"PX4 instance {i} exited with {proc.returncode}; see rootfs/{i}/px4.log")
+            if now >= next_beat:
+                # PX4 answers the first address that talks to it, and refuses to arm without a GCS.
+                for link in links.values():
+                    link.mav.heartbeat_send(
+                        mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0
+                    )
+                next_beat = now + HEARTBEAT_PERIOD_S
+            for i, link in links.items():
+                while (msg := link.recv_msg()) is not None:
+                    if msg.get_type() == "STATUSTEXT" and msg.severity <= mavutil.mavlink.MAV_SEVERITY_WARNING:
+                        print(f"  px4 {i}: {msg.text}")
+            time.sleep(POLL_PERIOD_S)
+        return True
+
+    def must(seconds: float, done: Any, what: str) -> None:
+        """Pump until done() holds, or stop the run naming what never happened."""
+        if not pump(seconds, done):
+            raise SystemExit(f"timed out after {seconds:g}s waiting for {what}")
+
+    def position(link: Any) -> Any:
+        """Latest GLOBAL_POSITION_INT from a link, or None before the first."""
+        return link.messages.get("GLOBAL_POSITION_INT")
+
+    try:
+        for i in ids:
+            procs[i] = launch_px4(px4_root, i, args.airframe)
+            links[i] = mavutil.mavlink_connection(f"udpout:127.0.0.1:{PX4_API_PORT + i}", source_system=GCS_SYSTEM_ID)
+        print(f"PX4 x{len(ids)} starting; each dials HIL on 127.0.0.1:{HIL_BASE_PORT + ids[0]}..")
+        # sysid locks onto the first autopilot heartbeat; the simulator's camera heartbeats, which PX4
+        # forwards on this link too, do not count.
+        must(PX4_BOOT_TIMEOUT_S, lambda: all(link.sysid for link in links.values()), "PX4 heartbeats")
+
+        for link in links.values():
+            link.param_set_send("MIS_TAKEOFF_ALT", args.alt, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+            # set_mode() would guess the autopilot from the last HEARTBEAT, which may be that camera's.
+            link.set_mode_px4(*mavutil.px4_map["TAKEOFF"])
+        # Pre-arm checks refuse until the estimator has settled on GPS, so ask again until it takes.
+        print(f"arming, then taking off to {args.alt:g} m")
+
+        def armed() -> bool:
+            return all(link.motors_armed() for link in links.values())
+
+        # From the first arm on, Ctrl+C means land, not kill the autopilots in the air.
+        try:
+            end = time.time() + ARM_TIMEOUT_S
+            while not armed():
+                if time.time() > end:
+                    raise SystemExit(f"not armed after {ARM_TIMEOUT_S:g}s; the px4 lines above say why")
+                for link in links.values():
+                    if not link.motors_armed():
+                        link.arducopter_arm()
+                pump(ARM_RETRY_S, armed)
+
+            top = (args.alt - ALT_TOLERANCE_M) * MM_PER_M
+            must(
+                TAKEOFF_TIMEOUT_S,
+                lambda: all((p := position(link)) and p.relative_alt >= top for link in links.values()),
+                "the climb",
+            )
+
+            # The centre is where the fleet is, not where it was asked to be: spawns snap to the ground.
+            fixes = [position(link) for link in links.values()]
+            lat0 = sum(p.lat for p in fixes) / len(fixes) / DEG_E7
+            lon0 = sum(p.lon for p in fixes) / len(fixes) / DEG_E7
+            amsl = sum(p.alt for p in fixes) / len(fixes) / MM_PER_M
+            north_m = math.radians(1.0) * EARTH_RADIUS_M
+            east_m = north_m * math.cos(math.radians(lat0))
+            offsets = [math.hypot((p.lat / DEG_E7 - lat0) * north_m, (p.lon / DEG_E7 - lon0) * east_m) for p in fixes]
+            radius = sum(offsets) / len(offsets)
+            print(f"orbiting {lat0:.7f},{lon0:.7f} at {amsl:.1f} m AMSL, radius {radius:.1f} m, {args.speed:g} m/s")
+            for link in links.values():
+                link.messages.pop("COMMAND_ACK", None)
+            # All at once and alike, so the ring they started in is the ring they keep.
+            for link in links.values():
+                link.mav.command_int_send(
+                    link.target_system,
+                    link.target_component,
+                    mavutil.mavlink.MAV_FRAME_GLOBAL,
+                    MAV_CMD_DO_ORBIT,
+                    0,
+                    0,
+                    radius,
+                    args.speed,
+                    ORBIT_YAW_FRONT_TO_CENTRE,
+                    0,
+                    round(lat0 * DEG_E7),
+                    round(lon0 * DEG_E7),
+                    amsl,
+                )
+            acked = lambda: all(  # noqa: E731
+                (a := link.messages.get("COMMAND_ACK")) and a.command == MAV_CMD_DO_ORBIT for link in links.values()
+            )
+            must(ACK_TIMEOUT_S, acked, "the orbit to be acknowledged")
+            refused = [
+                i
+                for i, link in links.items()
+                if link.messages["COMMAND_ACK"].result != mavutil.mavlink.MAV_RESULT_ACCEPTED
+            ]
+            if refused:
+                raise SystemExit(f"orbit refused by instance(s) {refused}")
+
+            print("orbiting; Ctrl+C lands")
+            while True:
+                pump(STATUS_PERIOD_S, lambda: False)
+                line = "  ".join(
+                    f"{i}: {p.relative_alt / MM_PER_M:4.1f} m {math.hypot(p.vx, p.vy) / CM_PER_M:3.1f} m/s"
+                    for i, link in links.items()
+                    if (p := position(link))
+                )
+                print(line)
+        except KeyboardInterrupt:
+            pass
+
+        print("landing")
+        for link in links.values():
+            link.set_mode_px4(*mavutil.px4_map["LAND"])
+        must(LAND_TIMEOUT_S, lambda: not any(link.motors_armed() for link in links.values()), "the landing")
+    finally:
+        for proc in procs.values():
+            proc.terminate()
+        for proc in procs.values():
+            proc.wait()
+    return 0
+
+
 # -------------------------------------------------------------------------- bridge
 
 
 def cmd_bridge(args: argparse.Namespace) -> int:
-    """Decode each stream in the manifest and publish it as a sensor_msgs/msg/Image topic.
+    """Publish each stream in the manifest as a foxglove_msgs/msg/CompressedVideo topic.
 
     Args:
     ----
@@ -380,15 +681,18 @@ def cmd_bridge(args: argparse.Namespace) -> int:
 
     """
     import rclpy
+    from foxglove_msgs.msg import CompressedVideo
+    from geometry_msgs.msg import TransformStamped
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import Image
+    from tf2_msgs.msg import TFMessage
 
     m = json.loads(Path(args.manifest).read_text())
     host, pairs = m["host"], [(s["port"], s["topic"]) for s in m["streams"]]
+    frames = {s["instance_id"]: f"{s['aircraft']}_{s['instance_id']}/base_link" for s in m["streams"]}
 
     class Stream(threading.Thread):
-        """Decodes one aircraft's stream and publishes every frame it decodes."""
+        """Forwards one aircraft's H.264 access units, undecoded, one message per frame."""
 
         def __init__(self, node: Any, host: str, port: int, topic: str) -> None:
             super().__init__(daemon=True)
@@ -396,30 +700,26 @@ def cmd_bridge(args: argparse.Namespace) -> int:
             self.port = port
             self.topic = topic
             self.frames = 0
-            self.started = time.time()
-            self.size = "?"
             self.error = ""
-            self.pub = node.create_publisher(Image, topic, qos_profile_sensor_data)
+            self.pub = node.create_publisher(CompressedVideo, topic, qos_profile_sensor_data)
             self.container = open_stream(host, port)
             self.vstream = self.container.streams.video[0]
             self.size = f"{self.vstream.width}x{self.vstream.height}"
 
         def run(self) -> None:
             try:
-                for frame in self.container.decode(self.vstream):
-                    msg = Image()
-                    msg.header.stamp = self.node.get_clock().now().to_msg()
-                    msg.header.frame_id = self.topic.strip("/").replace("/", "_")
-                    msg.height = int(frame.height)
-                    msg.width = int(frame.width)
-                    msg.encoding = "rgb8"
-                    msg.is_bigendian = 0
-                    msg.step = int(frame.width) * 3
-                    # Hand the buffer over as a flat view rather than tobytes(). Image.data
-                    # copies into an array.array either way, so tobytes() would add a second
-                    # full copy of every frame -- 1.1 MB each, four streams at 20 Hz is ~90 MB/s
-                    # of pure memcpy. to_ndarray() is C-contiguous, so reshape(-1) is a view.
-                    msg.data = frame.to_ndarray(format="rgb24").reshape(-1)
+                # The RTP demuxer hands over Annex B access units, and the simulator puts SPS/PPS
+                # ahead of every keyframe with no B-frames -- exactly what Foxglove decodes.
+                for packet in self.container.demux(self.vstream):
+                    if packet.size == 0:
+                        continue
+                    msg = CompressedVideo()
+                    msg.timestamp = self.node.get_clock().now().to_msg()
+                    msg.frame_id = self.topic.strip("/").replace("/", "_")
+                    msg.format = "h264"
+                    # array.array, not bytes: Humble's uint8[] setter checks a plain sequence
+                    # element by element, and rejects an ndarray outright.
+                    msg.data = array.array("B", bytes(packet))
                     self.pub.publish(msg)
                     self.frames += 1
             except Exception as exc:
@@ -443,14 +743,50 @@ def cmd_bridge(args: argparse.Namespace) -> int:
         s.start()
         node.get_logger().info(f"publishing {s.topic}  {s.size} from udp port {s.port}")
 
+    # Rate over the last report period: an average since start would carry the stream's
+    # start-up wait forever and read low.
+    last = {s.topic: (s.frames, time.time()) for s in streams}
+
     def report() -> None:
-        """Log one line per stream with its running average."""
+        """Log one line per stream with its rate over the last period."""
         for s in streams:
-            hz = s.frames / max(1e-6, time.time() - s.started)
+            frames, since = last[s.topic]
+            now = time.time()
+            hz = (s.frames - frames) / (now - since)
+            last[s.topic] = (s.frames, now)
             line = f"{s.topic}  {s.frames} frames  {hz:5.1f} Hz  {s.size}"
             node.get_logger().info(line + (f"  ERROR {s.error}" if s.error else ""))
 
     node.create_timer(args.report, report)
+
+    # The simulator's own pose of every aircraft, one call for the fleet: ground truth, in one
+    # frame, where each autopilot's estimate would sit in a frame of its own.
+    sim = import_pterosim()(args.address)
+    tf_pub = node.create_publisher(TFMessage, "/tf", TF_QUEUE_DEPTH)
+
+    def publish_poses() -> None:
+        """Publish map -> <aircraft>_<id>/base_link for every aircraft in the manifest."""
+        out = TFMessage()
+        stamp = node.get_clock().now().to_msg()
+        for a in sim.aircraft_status():
+            if a.instance_id not in frames:
+                continue
+            t = TransformStamped()
+            t.header.stamp = stamp
+            t.header.frame_id = WORLD_FRAME
+            t.child_frame_id = frames[a.instance_id]
+            # Unreal is left-handed with Y to the right, pitch nose-up and yaw clockwise; ROS is
+            # right-handed with Y to the left, pitch nose-down and yaw counter-clockwise.
+            t.transform.translation.x = a.x / CM_PER_M
+            t.transform.translation.y = -a.y / CM_PER_M
+            t.transform.translation.z = a.z / CM_PER_M
+            q = quaternion_from_rpy(math.radians(a.roll), -math.radians(a.pitch), -math.radians(a.yaw))
+            r = t.transform.rotation
+            r.x, r.y, r.z, r.w = q
+            out.transforms.append(t)
+        tf_pub.publish(out)
+
+    node.create_timer(1.0 / TF_RATE_HZ, publish_poses)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -458,6 +794,8 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     finally:
         for s in streams:
             s.close()
+        # Channel close only. shutdown() would take the whole simulator down.
+        sim.close()
         if rclpy.ok():
             rclpy.shutdown()
     return 0
@@ -504,22 +842,23 @@ def cmd_foxglove(args: argparse.Namespace) -> int:
         print(
             "the foxglove_bridge package is not installed.\n"
             "Install it with:\n"
-            "  sudo apt install ros-jazzy-foxglove-bridge",
+            f"  sudo apt install ros-{os.environ['ROS_DISTRO']}-foxglove-bridge",
             file=sys.stderr,
         )
         return 1
 
-    # Restricting the whitelist keeps four 768x480 image topics from being joined by whatever
-    # else is on the bus, which is what makes the bridge fall over on a busy graph.
+    # The bridge reads its settings only as ROS parameters -- plain --port/--topics arguments are
+    # silently ignored. The whitelist keeps whatever else is on the bus out of the client.
     cmd = [
         "ros2",
         "run",
         "foxglove_bridge",
         "foxglove_bridge",
-        "--port",
-        str(args.port),
-        "--topics",
-        args.topics,
+        "--ros-args",
+        "-p",
+        f"port:={args.port}",
+        "-p",
+        f"topic_whitelist:=['{args.topics}']",
     ]
     print(f"serving {args.topics} on {FOXGLOVE_URL}")
     print(
@@ -548,39 +887,41 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     """
     import rclpy
+    from foxglove_msgs.msg import CompressedVideo
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import Image
 
     rclpy.init()
     node = Node("pterosim_camera_status")
-    # topic -> [(arrival time, width, height), ...]
-    seen: dict[str, list[tuple[float, int, int]]] = {}
+    # topic -> [(arrival time, payload bytes), ...]
+    seen: dict[str, list[tuple[float, int]]] = {}
     subs: list[Any] = []
 
-    def on_image(topic: str, msg: Any) -> None:
+    def on_frame(topic: str, msg: Any) -> None:
         """Record a frame's arrival time and size.
 
         Args:
         ----
             topic: Topic the frame arrived on.
-            msg: The image message.
+            msg: The video message.
 
         """
-        seen.setdefault(topic, []).append((time.time(), msg.width, msg.height))
+        seen.setdefault(topic, []).append((time.time(), len(msg.data)))
 
     end = time.time() + args.seconds
     while time.time() < end:
         rclpy.spin_once(node, timeout_sec=0.05)
 
     for name, types in node.get_topic_names_and_types():
-        if "sensor_msgs/msg/Image" in types:
+        if VIDEO_TYPE in types:
             subs.append(
-                node.create_subscription(Image, name, functools.partial(on_image, name), qos_profile_sensor_data)
+                node.create_subscription(
+                    CompressedVideo, name, functools.partial(on_frame, name), qos_profile_sensor_data
+                )
             )
 
     if not subs:
-        print("no sensor_msgs/msg/Image topics on the bus -- is the bridge running?")
+        print(f"no {VIDEO_TYPE} topics on the bus -- is the bridge running?")
         rclpy.shutdown()
         return 1
 
@@ -595,8 +936,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         fr = seen[name]
         total += len(fr)
         span = max(1e-6, fr[-1][0] - fr[0][0])
-        w, h = fr[-1][1], fr[-1][2]
-        print(f"{name}  {len(fr):>4} frames  {len(fr)/span:5.1f} Hz  {w}x{h}")
+        kbps = sum(n for _, n in fr) * 8 / 1000 / span
+        print(f"{name}  {len(fr):>4} frames  {len(fr)/span:5.1f} Hz  {kbps:6.0f} kbit/s")
     print(f"\ntotal {total} frames in {args.seconds:g}s across {len(seen)} topic(s)")
 
     node.destroy_node()
@@ -628,25 +969,33 @@ def main() -> int:
     s.add_argument("--host", default=None, help="address the cameras stream to; auto-detected by default")
     s.add_argument("--address", default=GRPC_ADDRESS, help="PteroSim gRPC host:port")
     s.add_argument(
-        "--spacing", type=float, default=25.0, help="distance from the square's centre to each aircraft, in metres"
+        "--spacing", type=float, default=2.5, help="distance from the ring's centre to each aircraft, in metres"
     )
-    s.add_argument("--alt", type=float, default=30.0, help="spawn altitude, in metres")
     s.add_argument(
         "--layout",
         default=None,
-        help="hand-placed formation as x,y,yaw triples, e.g. '-10,-10,45; 10,-10,-45'",
+        help="hand-placed formation as x,y,yaw triples in metres and degrees, e.g. '-10,-10,45; 10,-10,135'",
     )
     s.add_argument("--respawn", action="store_true", help="remove existing aircraft first, to pick up a new formation")
     s.set_defaults(func=cmd_setup)
 
-    s = sub.add_parser("bridge", help="publish the streams as Image topics")
+    s = sub.add_parser("fly", help="start PX4 for each aircraft, take off and orbit, nose to the centre")
     s.add_argument("--manifest", default=MANIFEST)
+    s.add_argument("--px4", required=True, help="PX4-Autopilot checkout with a built px4_sitl_default")
+    s.add_argument("--airframe", type=int, default=PX4_AIRFRAME, help="SYS_AUTOSTART of the vehicle's PX4 airframe")
+    s.add_argument("--alt", type=float, default=30.0, help="takeoff altitude above the ground, in metres")
+    s.add_argument("--speed", type=float, default=1.0, help="orbit speed in m/s; PX4 caps it at sqrt(2 * radius)")
+    s.set_defaults(func=cmd_fly)
+
+    s = sub.add_parser("bridge", help="publish the streams as CompressedVideo topics, and the poses as /tf")
+    s.add_argument("--manifest", default=MANIFEST)
+    s.add_argument("--address", default=GRPC_ADDRESS, help="PteroSim gRPC host:port, for the poses")
     s.add_argument("--report", type=float, default=10.0)
     s.set_defaults(func=cmd_bridge)
 
     s = sub.add_parser("foxglove", help="serve the camera topics to Foxglove")
     s.add_argument("--port", type=int, default=8765)
-    s.add_argument("--topics", default="/x500_[0-9]+/.*image_raw", help="topic whitelist for the bridge")
+    s.add_argument("--topics", default="/x500_[0-9]+/.*compressed_video|/tf", help="topic whitelist for the bridge")
     s.set_defaults(func=cmd_foxglove)
 
     s = sub.add_parser("status", help="what is publishing, and at what rate")
@@ -654,7 +1003,9 @@ def main() -> int:
     s.set_defaults(func=cmd_status)
 
     args = p.parse_args()
-    if args.cmd in ("bridge", "view", "status"):
+    if args.cmd in ("bridge", "foxglove", "status"):
+        # Set before the re-exec, so the sourced environment inherits it.
+        os.environ["RMW_IMPLEMENTATION"] = RMW
         ensure_ros()
     return int(args.func(args))
 
