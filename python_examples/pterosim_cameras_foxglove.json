@@ -1,0 +1,50 @@
+{
+  "configById": {
+    "Image!cam0": {
+      "imageMode": {
+        "imageTopic": "/x500_0/gimbal_camera/compressed_video"
+      }
+    },
+    "Image!cam1": {
+      "imageMode": {
+        "imageTopic": "/x500_1/gimbal_camera/compressed_video"
+      }
+    },
+    "Image!cam2": {
+      "imageMode": {
+        "imageTopic": "/x500_2/gimbal_camera/compressed_video"
+      }
+    },
+    "Image!cam3": {
+      "imageMode": {
+        "imageTopic": "/x500_3/gimbal_camera/compressed_video"
+      }
+    },
+    "3D!fleet": {
+      "followTf": "map"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "direction": "row",
+    "first": {
+      "direction": "column",
+      "first": {
+        "direction": "row",
+        "first": "Image!cam0",
+        "second": "Image!cam1"
+      },
+      "second": {
+        "direction": "row",
+        "first": "Image!cam2",
+        "second": "Image!cam3"
+      }
+    },
+    "second": "3D!fleet",
+    "splitPercentage": 70
+  }
+}
