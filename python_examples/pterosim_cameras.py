@@ -2,33 +2,34 @@
 """PteroSim drone cameras -> ROS 2 -> Foxglove, in one file.
 
 Flies a ring of aircraft around its own centre with every nose on that centre, and publishes each
-aircraft's gimbal camera to ROS 2 as foxglove_msgs/msg/CompressedVideo, with the fleet's poses on
-/tf. Viewing is left to Foxglove, so there is no viewer here. The steps:
+aircraft's gimbal camera to ROS 2 as foxglove_msgs/msg/CompressedVideo, with PX4's estimate of
+every aircraft's pose on /tf. Viewing is left to Foxglove, so there is no viewer here. The steps:
 
-    pterosim_cameras.py setup     spawn the ring, point the cameras at this machine, start
-    pterosim_cameras.py fly       one PX4 SITL per aircraft: take off, orbit; Ctrl+C lands
-    pterosim_cameras.py bridge    publish the streams and the poses to ROS 2
-    pterosim_cameras.py foxglove  serve those topics to Foxglove over a WebSocket
-    pterosim_cameras.py status    what is publishing, and at what rate
+    pterosim_cameras.py setup        spawn the ring, point the cameras at this machine, start
+    MicroXRCEAgent udp4 -p 8888      PX4's link to ROS 2; every PX4 instance shares this one Agent
+    pterosim_cameras.py fly          one PX4 SITL per aircraft: take off, orbit; Ctrl+C lands
+    pterosim_cameras.py bridge       publish the streams and PX4's poses to ROS 2
+    pterosim_cameras.py foxglove     serve those topics to Foxglove over a WebSocket
+    pterosim_cameras.py status       what is publishing, and at what rate
 
 `setup` puts four x500 on a circle, each facing its centre, and streams every gimbal_camera over
 RTP/H.264 to this machine; the simulator only accepts sensor settings while it is stopped, which
 is why this is a step of its own. `fly` starts one PX4 SITL per aircraft, takes the fleet off and
 orbits the circle's centre with every nose held on it: aircraft on one circle at one speed keep
 their spacing, so each camera keeps the others in view. `bridge` forwards the H.264 frames
-undecoded and publishes the simulator's pose of every aircraft as map -> x500_<id>/base_link.
+undecoded and turns each PX4's vehicle_odometry into map -> x500_<id>/base_link.
 
 WHICH MACHINE RUNS WHICH STEP
 
 `setup` talks to the simulator over gRPC, and the simulator binds that server to 127.0.0.1, so
 `setup` runs where PteroSim runs. The other steps run in WSL next to ROS 2 and PX4; with mirrored
-networking WSL reaches that loopback too, which is how `bridge` reads the poses. The steps share a
+networking PX4 reaches the simulator's HIL ports on that loopback too. The steps share a
 manifest: `setup` writes it next to the user's home, and WSL reaches it as
 /mnt/c/Users/<you>/camera_fleet.json, so the steps there need --manifest pointed at that path.
 
-Under mirrored WSL networking FastDDS, ROS 2's default, does not discover a second process, so the
-ROS steps here run on CycloneDDS. Any other node that should see these topics needs
-RMW_IMPLEMENTATION=rmw_cyclonedds_cpp too. From Windows, connect Foxglove to ws://127.0.0.1:8765:
+Mirrored WSL drops UDP over 1472 bytes sent to 127.0.0.1, which breaks Fast DDS discovery between
+local nodes, so the ROS steps load fastdds_wsl.xml; any other ROS node needs it too, via
+FASTRTPS_DEFAULT_PROFILES_FILE. From Windows, connect Foxglove to ws://127.0.0.1:8765:
 localhost resolves to ::1 first, which mirrored WSL does not forward.
 python_examples/pterosim_cameras_foxglove.json is a ready layout -- the four cameras and a 3D view
 of the fleet -- import it in Foxglove instead of arranging the panels by hand.
@@ -57,13 +58,12 @@ Two details that are easy to get wrong:
 
 The cameras are configured for 768x480; --tile changes that.
 
-Requires: ROS 2 with foxglove_msgs and rmw_cyclonedds_cpp, PyAV, the PteroSim SDK for `setup` and
-`bridge` ($PTEROSIM_SDK), and for `fly` pymavlink plus a PX4-Autopilot checkout built for
-px4_sitl_default with the vehicle's airframe installed. `foxglove` needs the foxglove_bridge
-package:
+Requires: ROS 2 with foxglove_msgs, PyAV, the PteroSim SDK for `setup`
+($PTEROSIM_SDK), and for `fly` pymavlink plus a PX4-Autopilot checkout built for px4_sitl_default
+with the vehicle's airframe installed. The Micro XRCE-DDS Agent and px4_msgs as in PX4's ROS 2 User
+Guide, px4_msgs sourced for `bridge` and `foxglove`. `foxglove` needs the foxglove_bridge package:
 
     sudo apt install ros-$ROS_DISTRO-foxglove-bridge ros-$ROS_DISTRO-foxglove-msgs
-    sudo apt install ros-$ROS_DISTRO-rmw-cyclonedds-cpp
 """
 
 import argparse
@@ -87,16 +87,14 @@ CM_PER_M = 100.0
 MANIFEST = str(Path.home() / "camera_fleet.json")
 # The simulator binds its scripting server to loopback only -- PteroSimScripting's
 # GrpcServer.cpp hardcodes 127.0.0.1, and the port defaults to 10010. So `setup` has to run on
-# the same machine as PteroSim, which for this setup is Windows. Mirrored WSL networking
-# reaches that loopback too, which is how `bridge` reads the poses from WSL.
+# the same machine as PteroSim, which for this setup is Windows.
 GRPC_ADDRESS = "127.0.0.1:10010"
 # 127.0.0.1, not localhost: from Windows, localhost resolves to ::1 first, which mirrored WSL
 # does not forward, and the WebSocket handshake hangs.
 FOXGLOVE_URL = "ws://127.0.0.1:8765"
 VIDEO_TYPE = "foxglove_msgs/msg/CompressedVideo"
-# FastDDS, ROS 2's default, never discovers a second process under mirrored WSL networking --
-# measured on Humble, while CycloneDDS finds the same peers at once.
-RMW = "rmw_cyclonedds_cpp"
+# Measured on Humble's Fast DDS 2.6.12 under mirrored WSL; see the module docstring.
+FASTDDS_PROFILE = str(Path(__file__).resolve().parent / "fastdds_wsl.xml")
 
 # PX4's onboard link for an API listens on this + instance id (px4-rc.mavlink).
 PX4_API_PORT = 14580
@@ -119,8 +117,9 @@ EARTH_RADIUS_M = 6_371_000.0  # mean radius (IUGG); metres per degree near the g
 MAV_CMD_DO_ORBIT = 34  # MAVLink common.xml
 ORBIT_YAW_FRONT_TO_CENTRE = 0  # PX4 msg/OrbitStatus.msg HOLD_FRONT_TO_CIRCLE_CENTER
 WORLD_FRAME = "map"
-TF_RATE_HZ = 20.0  # chosen: smooth in a 3D view; each call waits about one simulator frame
+TF_RATE_HZ = 20.0  # chosen: smooth in a 3D view; PX4 sends odometry at 100 Hz (dds_topics.yaml)
 TF_QUEUE_DEPTH = 10  # rclpy's customary history depth
+SQRT_HALF = math.sqrt(0.5)  # cos and sin of 45 degrees: NED->ENU and FRD->FLU are both half-turns
 
 
 # --------------------------------------------------------------------------- shared
@@ -294,29 +293,34 @@ def import_pterosim() -> Any:
     return PteroSim
 
 
-def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
-    """Quaternion of ROS fixed-axis roll, pitch and yaw.
+def vehicle_ns(stream: dict[str, Any]) -> str:
+    """ROS namespace of one aircraft in the manifest, shared by its camera, its PX4 and its tf frame."""
+    return f"{stream['aircraft']}_{stream['instance_id']}"
+
+
+def metres_per_degree(lat: float) -> tuple[float, float]:
+    """Metres per degree of latitude and of longitude at a latitude, on a spherical Earth."""
+    north = math.radians(1.0) * EARTH_RADIUS_M
+    return north, north * math.cos(math.radians(lat))
+
+
+def enu_flu_pose(ned: Any, q: Any) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Turn a PX4 pose into ROS conventions.
 
     Args:
     ----
-        roll: About X, in radians.
-        pitch: About Y, in radians.
-        yaw: About Z, in radians.
+        ned: Position, north-east-down, in metres.
+        q: PX4's quaternion (w, x, y, z) from the forward-right-down body to NED.
 
     Returns:
     -------
-        The quaternion as (x, y, z, w).
+        Position east-north-up, and the quaternion (x, y, z, w) from the forward-left-up body to ENU.
 
     """
-    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
-    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
-    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
-    return (
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-        cr * cp * cy + sr * sp * sy,
-    )
+    n, e, d = (float(v) for v in ned)
+    w, x, y, z = (float(v) for v in q)
+    # q_ENU<-NED * q * q_FRD<-FLU, with both half-turns multiplied out.
+    return (e, n, -d), (SQRT_HALF * (x + y), SQRT_HALF * (x - y), SQRT_HALF * (w - z), SQRT_HALF * (w + z))
 
 
 def ensure_ros() -> None:
@@ -426,11 +430,14 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 stream_port=stream_port,
                 stream_host=host,
             )
-            aircraft = getattr(drone, "aircraft_name", None) or args.aircraft
-            topic = f"/{aircraft}_{i}/{cam.name}/compressed_video"
-            streams.append(
-                {"instance_id": i, "aircraft": aircraft, "camera": cam.name, "port": stream_port + i, "topic": topic}
-            )
+            stream = {
+                "instance_id": i,
+                "aircraft": getattr(drone, "aircraft_name", None) or args.aircraft,
+                "camera": cam.name,
+                "port": stream_port + i,
+            }
+            topic = stream["topic"] = f"/{vehicle_ns(stream)}/{cam.name}/compressed_video"
+            streams.append(stream)
             print(f"  instance {i}: {cam.name} -> udp://{host}:{stream_port + i}  {topic}")
 
         sim.start()
@@ -446,7 +453,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 # ----------------------------------------------------------------------------- fly
 
 
-def launch_px4(px4_root: Path, instance: int, airframe: int) -> Any:
+def launch_px4(px4_root: Path, instance: int, airframe: int, namespace: str) -> Any:
     """Start one PX4 SITL instance that flies the simulator's aircraft of that instance id.
 
     Args:
@@ -454,6 +461,7 @@ def launch_px4(px4_root: Path, instance: int, airframe: int) -> Any:
         px4_root: The PX4-Autopilot checkout, built with `make px4_sitl_default`.
         instance: The aircraft's instance id; PX4 then dials HIL on 4560 + instance.
         airframe: SYS_AUTOSTART id of the vehicle's PX4 airframe.
+        namespace: ROS namespace of the aircraft's uXRCE-DDS topics.
 
     Returns:
     -------
@@ -471,7 +479,8 @@ def launch_px4(px4_root: Path, instance: int, airframe: int) -> Any:
     # No PX4_SIM_MODEL: that selects PX4's own simulators. The simulator is the Windows process,
     # which mirrored WSL reaches on loopback.
     env = {k: v for k, v in os.environ.items() if k != "PX4_SIM_MODEL"}
-    env.update(PX4_SIM_HOSTNAME="127.0.0.1", PX4_SYS_AUTOSTART=str(airframe))
+    # rcS would name the topics px4_<i>, and leave instance 0 with none at all.
+    env.update(PX4_SIM_HOSTNAME="127.0.0.1", PX4_SYS_AUTOSTART=str(airframe), PX4_UXRCE_DDS_NS=namespace)
     with (rootfs / "px4.log").open("w") as log:
         # A session of its own: Ctrl+C in this terminal must reach this script, which lands the
         # fleet, and not the autopilots, which would quit in the air.
@@ -510,7 +519,8 @@ def cmd_fly(args: argparse.Namespace) -> int:
             f"firmwares/px4_* there as {args.airframe}_<name>, through `tr -d '\\r'` if it comes from a "
             "Windows checkout"
         )
-    ids = [s["instance_id"] for s in json.loads(Path(args.manifest).read_text())["streams"]]
+    streams = json.loads(Path(args.manifest).read_text())["streams"]
+    ids = [s["instance_id"] for s in streams]
     procs: dict[int, Any] = {}
     links: dict[int, Any] = {}
     next_beat = 0.0
@@ -564,8 +574,9 @@ def cmd_fly(args: argparse.Namespace) -> int:
         return link.messages.get("GLOBAL_POSITION_INT")
 
     try:
-        for i in ids:
-            procs[i] = launch_px4(px4_root, i, args.airframe)
+        for s in streams:
+            i = s["instance_id"]
+            procs[i] = launch_px4(px4_root, i, args.airframe, vehicle_ns(s))
             links[i] = mavutil.mavlink_connection(f"udpout:127.0.0.1:{PX4_API_PORT + i}", source_system=GCS_SYSTEM_ID)
         print(f"PX4 x{len(ids)} starting; each dials HIL on 127.0.0.1:{HIL_BASE_PORT + ids[0]}..")
         # sysid locks onto the first autopilot heartbeat; the simulator's camera heartbeats, which PX4
@@ -605,8 +616,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
             lat0 = sum(p.lat for p in fixes) / len(fixes) / DEG_E7
             lon0 = sum(p.lon for p in fixes) / len(fixes) / DEG_E7
             amsl = sum(p.alt for p in fixes) / len(fixes) / MM_PER_M
-            north_m = math.radians(1.0) * EARTH_RADIUS_M
-            east_m = north_m * math.cos(math.radians(lat0))
+            north_m, east_m = metres_per_degree(lat0)
             offsets = [math.hypot((p.lat / DEG_E7 - lat0) * north_m, (p.lon / DEG_E7 - lon0) * east_m) for p in fixes]
             radius = sum(offsets) / len(offsets)
             print(f"orbiting {lat0:.7f},{lon0:.7f} at {amsl:.1f} m AMSL, radius {radius:.1f} m, {args.speed:g} m/s")
@@ -669,7 +679,7 @@ def cmd_fly(args: argparse.Namespace) -> int:
 
 
 def cmd_bridge(args: argparse.Namespace) -> int:
-    """Publish each stream in the manifest as a foxglove_msgs/msg/CompressedVideo topic.
+    """Publish each stream in the manifest as CompressedVideo, and each PX4's pose on /tf.
 
     Args:
     ----
@@ -687,9 +697,16 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     from rclpy.qos import qos_profile_sensor_data
     from tf2_msgs.msg import TFMessage
 
+    try:
+        from px4_msgs.msg import VehicleLocalPosition, VehicleOdometry
+    except ImportError:
+        raise SystemExit(
+            "px4_msgs not found: set it up as PX4's ROS 2 User Guide says, and source its workspace"
+        ) from None
+
     m = json.loads(Path(args.manifest).read_text())
     host, pairs = m["host"], [(s["port"], s["topic"]) for s in m["streams"]]
-    frames = {s["instance_id"]: f"{s['aircraft']}_{s['instance_id']}/base_link" for s in m["streams"]}
+    names = [vehicle_ns(s) for s in m["streams"]]
 
     class Stream(threading.Thread):
         """Forwards one aircraft's H.264 access units, undecoded, one message per frame."""
@@ -702,6 +719,8 @@ def cmd_bridge(args: argparse.Namespace) -> int:
             self.frames = 0
             self.error = ""
             self.pub = node.create_publisher(CompressedVideo, topic, qos_profile_sensor_data)
+            # open_stream blocks until the stream's first keyframe, with no timeout of its own.
+            node.get_logger().info(f"{topic}: waiting for the stream on udp port {port}")
             self.container = open_stream(host, port)
             self.vstream = self.container.streams.video[0]
             self.size = f"{self.vstream.width}x{self.vstream.height}"
@@ -747,44 +766,88 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     # start-up wait forever and read low.
     last = {s.topic: (s.frames, time.time()) for s in streams}
 
+    # PX4's own estimate of every aircraft, latest of each, and where each estimator started.
+    odometry: dict[str, Any] = {}
+    origins: dict[str, tuple[float, float, float]] = {}
+    heard: set[str] = set()  # aircraft whose PX4 sent odometry since the last report
+
+    def on_odometry(ns: str, msg: Any) -> None:
+        """Keep an aircraft's latest PX4 odometry, and when it arrived, until the next tf tick sends it."""
+        odometry[ns] = (msg, node.get_clock().now().to_msg())
+        heard.add(ns)
+
+    def px4_topic(ns: str, name: str, msg_type: Any) -> str:
+        """Name PX4's uXRCE-DDS client publishes a topic under: versioned messages carry _v<N>."""
+        # px4_msgs before PX4 1.16 has no MESSAGE_VERSION; PX4 reads a missing one as 0 too.
+        version = getattr(msg_type, "MESSAGE_VERSION", 0)
+        return f"/{ns}/fmu/out/{name}" + (f"_v{version}" if version else "")
+
+    def on_origin(ns: str, msg: Any) -> None:
+        """Keep the global position of an aircraft's local origin, once its estimator has one."""
+        if msg.xy_global and msg.z_global:
+            origins[ns] = (msg.ref_lat, msg.ref_lon, msg.ref_alt)
+
+    for ns in names:
+        node.create_subscription(
+            VehicleOdometry,
+            px4_topic(ns, "vehicle_odometry", VehicleOdometry),
+            functools.partial(on_odometry, ns),
+            qos_profile_sensor_data,
+        )
+        node.create_subscription(
+            VehicleLocalPosition,
+            px4_topic(ns, "vehicle_local_position", VehicleLocalPosition),
+            functools.partial(on_origin, ns),
+            qos_profile_sensor_data,
+        )
+
     def report() -> None:
-        """Log one line per stream with its rate over the last period."""
-        for s in streams:
+        """Log one line per stream with its rate over the last period, and what PX4 is missing."""
+        for s, ns in zip(streams, names, strict=True):
             frames, since = last[s.topic]
             now = time.time()
             hz = (s.frames - frames) / (now - since)
             last[s.topic] = (s.frames, now)
             line = f"{s.topic}  {s.frames} frames  {hz:5.1f} Hz  {s.size}"
+            if ns not in heard:
+                line += "  no PX4 odometry this period"
+            elif ns not in origins:
+                line += "  no PX4 origin yet"
             node.get_logger().info(line + (f"  ERROR {s.error}" if s.error else ""))
+        heard.clear()
 
     node.create_timer(args.report, report)
-
-    # The simulator's own pose of every aircraft, one call for the fleet: ground truth, in one
-    # frame, where each autopilot's estimate would sit in a frame of its own.
-    sim = import_pterosim()(args.address)
     tf_pub = node.create_publisher(TFMessage, "/tf", TF_QUEUE_DEPTH)
 
     def publish_poses() -> None:
-        """Publish map -> <aircraft>_<id>/base_link for every aircraft in the manifest."""
+        """Publish map -> <aircraft>_<id>/base_link for every aircraft PX4 has a valid pose for."""
+        # map's origin is the fleet's mean start, so it waits for every aircraft's origin.
+        if len(origins) < len(names):
+            return
+        lat0, lon0, alt0 = (sum(o[k] for o in origins.values()) / len(origins) for k in range(3))
+        north_m, east_m = metres_per_degree(lat0)
         out = TFMessage()
-        stamp = node.get_clock().now().to_msg()
-        for a in sim.aircraft_status():
-            if a.instance_id not in frames:
+        # Each sample goes out once, so a PX4 that goes quiet leaves its tf stale instead of re-sent.
+        for ns in list(odometry):
+            odom, arrived = odometry.pop(ns)
+            # NaN marks an estimate PX4 does not have yet.
+            if math.isnan(odom.position[0]) or math.isnan(odom.q[0]):
                 continue
+            (x, y, z), (qx, qy, qz, qw) = enu_flu_pose(odom.position, odom.q)
+            lat, lon, alt = origins[ns]
             t = TransformStamped()
-            t.header.stamp = stamp
+            # Arrival, like the video: under lockstep PX4's synced stamp swung -240..+575 ms here.
+            t.header.stamp = arrived
             t.header.frame_id = WORLD_FRAME
-            t.child_frame_id = frames[a.instance_id]
-            # Unreal is left-handed with Y to the right, pitch nose-up and yaw clockwise; ROS is
-            # right-handed with Y to the left, pitch nose-down and yaw counter-clockwise.
-            t.transform.translation.x = a.x / CM_PER_M
-            t.transform.translation.y = -a.y / CM_PER_M
-            t.transform.translation.z = a.z / CM_PER_M
-            q = quaternion_from_rpy(math.radians(a.roll), -math.radians(a.pitch), -math.radians(a.yaw))
+            t.child_frame_id = f"{ns}/base_link"
+            t.transform.translation.x = (lon - lon0) * east_m + x
+            t.transform.translation.y = (lat - lat0) * north_m + y
+            t.transform.translation.z = alt - alt0 + z
             r = t.transform.rotation
-            r.x, r.y, r.z, r.w = q
+            r.x, r.y, r.z, r.w = qx, qy, qz, qw
             out.transforms.append(t)
-        tf_pub.publish(out)
+        if out.transforms:
+            tf_pub.publish(out)
 
     node.create_timer(1.0 / TF_RATE_HZ, publish_poses)
     try:
@@ -794,8 +857,6 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     finally:
         for s in streams:
             s.close()
-        # Channel close only. shutdown() would take the whole simulator down.
-        sim.close()
         if rclpy.ok():
             rclpy.shutdown()
     return 0
@@ -987,9 +1048,8 @@ def main() -> int:
     s.add_argument("--speed", type=float, default=1.0, help="orbit speed in m/s; PX4 caps it at sqrt(2 * radius)")
     s.set_defaults(func=cmd_fly)
 
-    s = sub.add_parser("bridge", help="publish the streams as CompressedVideo topics, and the poses as /tf")
+    s = sub.add_parser("bridge", help="publish the streams as CompressedVideo topics, and PX4's poses as /tf")
     s.add_argument("--manifest", default=MANIFEST)
-    s.add_argument("--address", default=GRPC_ADDRESS, help="PteroSim gRPC host:port, for the poses")
     s.add_argument("--report", type=float, default=10.0)
     s.set_defaults(func=cmd_bridge)
 
@@ -1005,7 +1065,7 @@ def main() -> int:
     args = p.parse_args()
     if args.cmd in ("bridge", "foxglove", "status"):
         # Set before the re-exec, so the sourced environment inherits it.
-        os.environ["RMW_IMPLEMENTATION"] = RMW
+        os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = FASTDDS_PROFILE
         ensure_ros()
     return int(args.func(args))
 
