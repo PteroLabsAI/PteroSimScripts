@@ -42,7 +42,10 @@ consumes that stream instead of pulling frames over gRPC, which is what
 python_examples/drone_camera_display.py does. That matters: a gRPC pull is a synchronous GPU
 readback on the sim's render path, paid for every frame pulled, while reading a push stream
 touches nothing in the simulator. Nothing is decoded here either: Foxglove decodes
-H.264 itself, so the bridge only moves each access unit into a message.
+H.264 itself, so the bridge only moves each access unit into a message. Its timestamp is the
+instant the simulator captured the frame, read from the stamp the stream carries; `bridge` and
+`status` report how old frames are when they arrive, which holds while this machine's clock
+agrees with the simulator's.
 
 Two details that are easy to get wrong:
 
@@ -69,9 +72,12 @@ Guide, px4_msgs sourced for `bridge` and `foxglove`. `foxglove` needs the foxglo
 import argparse
 import array
 import functools
+import itertools
 import json
 import math
 import os
+import statistics
+import struct
 import sys
 import tempfile
 import threading
@@ -120,6 +126,20 @@ WORLD_FRAME = "map"
 TF_RATE_HZ = 20.0  # chosen: smooth in a 3D view; PX4 sends odometry at 100 Hz (dds_topics.yaml)
 TF_QUEUE_DEPTH = 10  # rclpy's customary history depth
 SQRT_HALF = math.sqrt(0.5)  # cos and sin of 45 degrees: NED->ENU and FRD->FLU are both half-turns
+# The simulator stamps every frame in an H.264 SEI user_data_unregistered under this UUID (PteroSimSensors,
+# RtpFrameStamp.h): the frame number, the capture wall clock and the simulation time, big-endian u64 microseconds.
+FRAME_STAMP_UUID = b"PteroSimFrame v1"
+FRAME_STAMP_FIELDS = struct.Struct(">QQQ")
+NAL_TYPE_MASK = 0x1F
+NAL_TYPE_SEI = 6  # H.264 Table 7-1
+SEI_USER_DATA_UNREGISTERED = 5  # H.264 D.1
+START_CODE = b"\x00\x00\x01"
+EMULATION_PREVENTION = (b"\x00\x00\x03", b"\x00\x00")  # H.264 7.4.1
+US_PER_S = 1_000_000
+US_PER_MS = 1_000
+NS_PER_US = 1_000
+NS_PER_S = 1_000_000_000
+PERCENTILE_95 = 0.95
 
 
 # --------------------------------------------------------------------------- shared
@@ -291,6 +311,32 @@ def import_pterosim() -> Any:
     from pterosim import PteroSim
 
     return PteroSim
+
+
+def frame_stamp(access_unit: bytes) -> tuple[int, int, int] | None:
+    """The simulator's stamp in an Annex B access unit: (frame, capture unix us, sim us), or None without one."""
+    payload_size = len(FRAME_STAMP_UUID) + FRAME_STAMP_FIELDS.size
+    header = bytes([SEI_USER_DATA_UNREGISTERED, payload_size]) + FRAME_STAMP_UUID
+    for nal in access_unit.split(START_CODE)[1:]:
+        if not nal or nal[0] & NAL_TYPE_MASK != NAL_TYPE_SEI:
+            continue
+        rbsp = nal[1:].replace(*EMULATION_PREVENTION)
+        if rbsp.startswith(header) and len(rbsp) >= len(header) + FRAME_STAMP_FIELDS.size:
+            frame, capture_us, sim_us = FRAME_STAMP_FIELDS.unpack_from(rbsp, len(header))
+            return frame, capture_us, sim_us
+    return None
+
+
+def latency_summary(what: str, latencies_us: list[int]) -> str:
+    """Median, 95th percentile, max and spread of a set of latencies, in milliseconds."""
+    if not latencies_us:
+        return f"{what}: no stamped frames"
+    ms = sorted(v / US_PER_MS for v in latencies_us)
+    p95 = ms[math.ceil(len(ms) * PERCENTILE_95) - 1]  # nearest rank
+    return (
+        f"{what}: median {statistics.median(ms):.1f} p95 {p95:.1f} max {ms[-1]:.1f} "
+        f"jitter {statistics.pstdev(ms):.1f} ms"
+    )
 
 
 def vehicle_ns(stream: dict[str, Any]) -> str:
@@ -691,6 +737,7 @@ def cmd_bridge(args: argparse.Namespace) -> int:
 
     """
     import rclpy
+    from builtin_interfaces.msg import Time
     from foxglove_msgs.msg import CompressedVideo
     from geometry_msgs.msg import TransformStamped
     from rclpy.node import Node
@@ -718,6 +765,7 @@ def cmd_bridge(args: argparse.Namespace) -> int:
             self.topic = topic
             self.frames = 0
             self.error = ""
+            self.latencies_us: list[int] = []  # capture to bridge, since the last report
             self.pub = node.create_publisher(CompressedVideo, topic, qos_profile_sensor_data)
             # open_stream blocks until the stream's first keyframe, with no timeout of its own.
             node.get_logger().info(f"{topic}: waiting for the stream on udp port {port}")
@@ -732,13 +780,23 @@ def cmd_bridge(args: argparse.Namespace) -> int:
                 for packet in self.container.demux(self.vstream):
                     if packet.size == 0:
                         continue
+                    data = bytes(packet)
+                    arrived_us = time.time_ns() // NS_PER_US
+                    stamp = frame_stamp(data)
+                    if stamp is None:
+                        raise RuntimeError(
+                            "a frame came without a capture stamp: this bridge needs a PteroSim that stamps its streams"
+                        )
                     msg = CompressedVideo()
-                    msg.timestamp = self.node.get_clock().now().to_msg()
+                    # The instant the frame shows: what /tf and PX4's state can be matched against.
+                    seconds, micros = divmod(stamp[1], US_PER_S)
+                    msg.timestamp = Time(sec=seconds, nanosec=micros * NS_PER_US)
+                    self.latencies_us.append(arrived_us - stamp[1])
                     msg.frame_id = self.topic.strip("/").replace("/", "_")
                     msg.format = "h264"
                     # array.array, not bytes: Humble's uint8[] setter checks a plain sequence
                     # element by element, and rejects an ndarray outright.
-                    msg.data = array.array("B", bytes(packet))
+                    msg.data = array.array("B", data)
                     self.pub.publish(msg)
                     self.frames += 1
             except Exception as exc:
@@ -808,7 +866,9 @@ def cmd_bridge(args: argparse.Namespace) -> int:
             now = time.time()
             hz = (s.frames - frames) / (now - since)
             last[s.topic] = (s.frames, now)
-            line = f"{s.topic}  {s.frames} frames  {hz:5.1f} Hz  {s.size}"
+            latencies, s.latencies_us = s.latencies_us, []
+            line = f"{s.topic}  {s.frames} frames  {hz:5.1f} Hz  {s.size}  "
+            line += latency_summary("capture to bridge", latencies)
             if ns not in heard:
                 line += "  no PX4 odometry this period"
             elif ns not in origins:
@@ -836,7 +896,7 @@ def cmd_bridge(args: argparse.Namespace) -> int:
             (x, y, z), (qx, qy, qz, qw) = enu_flu_pose(odom.position, odom.q)
             lat, lon, alt = origins[ns]
             t = TransformStamped()
-            # Arrival, like the video: under lockstep PX4's synced stamp swung -240..+575 ms here.
+            # Arrival on this clock (PX4's synced stamp swung -240..+575 ms here); frames carry the simulator's.
             t.header.stamp = arrived
             t.header.frame_id = WORLD_FRAME
             t.child_frame_id = f"{ns}/base_link"
@@ -956,10 +1016,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     node = Node("pterosim_camera_status")
     # topic -> [(arrival time, payload bytes), ...]
     seen: dict[str, list[tuple[float, int]]] = {}
+    latencies_us: dict[str, list[int]] = {}  # capture to here, stamped frames only
+    frame_numbers: dict[str, list[int]] = {}
     subs: list[Any] = []
 
     def on_frame(topic: str, msg: Any) -> None:
-        """Record a frame's arrival time and size.
+        """Record a frame's arrival time and size, and its age when it carries a capture stamp.
 
         Args:
         ----
@@ -967,7 +1029,13 @@ def cmd_status(args: argparse.Namespace) -> int:
             msg: The video message.
 
         """
-        seen.setdefault(topic, []).append((time.time(), len(msg.data)))
+        arrived_ns = time.time_ns()
+        data = bytes(msg.data)
+        seen.setdefault(topic, []).append((arrived_ns / NS_PER_S, len(data)))
+        stamp = frame_stamp(data)
+        if stamp:
+            latencies_us.setdefault(topic, []).append(arrived_ns // NS_PER_US - stamp[1])
+            frame_numbers.setdefault(topic, []).append(stamp[0])
 
     end = time.time() + args.seconds
     while time.time() < end:
@@ -988,6 +1056,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     # Measure over a clean window, after discovery has settled.
     seen.clear()
+    latencies_us.clear()
+    frame_numbers.clear()
     end = time.time() + args.seconds
     while time.time() < end:
         rclpy.spin_once(node, timeout_sec=0.02)
@@ -998,7 +1068,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         total += len(fr)
         span = max(1e-6, fr[-1][0] - fr[0][0])
         kbps = sum(n for _, n in fr) * 8 / 1000 / span
-        print(f"{name}  {len(fr):>4} frames  {len(fr)/span:5.1f} Hz  {kbps:6.0f} kbit/s")
+        line = f"{name}  {len(fr):>4} frames  {len(fr)/span:5.1f} Hz  {kbps:6.0f} kbit/s  "
+        line += latency_summary("capture to here", latencies_us.get(name, []))
+        numbers = frame_numbers.get(name)
+        if numbers:
+            # Numbers count frames asked for: a gap was dropped in the sim or on the way; a restart starts at 1.
+            missing = sum(max(0, b - a - 1) for a, b in itertools.pairwise(numbers))
+            line += f"  {missing} frame(s) missing"
+        print(line)
     print(f"\ntotal {total} frames in {args.seconds:g}s across {len(seen)} topic(s)")
 
     node.destroy_node()
