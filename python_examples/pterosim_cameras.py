@@ -125,6 +125,7 @@ ORBIT_YAW_FRONT_TO_CENTRE = 0  # PX4 msg/OrbitStatus.msg HOLD_FRONT_TO_CIRCLE_CE
 WORLD_FRAME = "map"
 TF_RATE_HZ = 20.0  # chosen: smooth in a 3D view; PX4 sends odometry at 100 Hz (dds_topics.yaml)
 TF_QUEUE_DEPTH = 10  # rclpy's customary history depth
+STREAM_READ_POLL_S = 1.0  # chosen: the longest a stop waits on a stream that has gone quiet
 SQRT_HALF = math.sqrt(0.5)  # cos and sin of 45 degrees: NED->ENU and FRD->FLU are both half-turns
 # The simulator stamps every frame in an H.264 SEI user_data_unregistered under this UUID (PteroSimSensors,
 # RtpFrameStamp.h): the frame number, the capture wall clock and the simulation time, big-endian u64 microseconds.
@@ -216,9 +217,12 @@ def open_stream(host: str, port: int) -> Any:
 
     # Nothing is decoded here, so no decoder options -- only ask the demuxer not to buffer or
     # reorder packets: a live preview is worth more than a packet-perfect order.
+    # Every read gives up after STREAM_READ_POLL_S (av.error.ExitError) so the caller can look for a
+    # stop; the open then returns too, stream or no stream, and the first read waits for it.
     return av.open(
         str(write_sdp(host, port)),
         format="sdp",
+        timeout=STREAM_READ_POLL_S,
         options={
             "protocol_whitelist": "file,rtp,udp",
             "fflags": "nobuffer",
@@ -736,10 +740,12 @@ def cmd_bridge(args: argparse.Namespace) -> int:
         Zero on success.
 
     """
+    import av
     import rclpy
     from builtin_interfaces.msg import Time
     from foxglove_msgs.msg import CompressedVideo
     from geometry_msgs.msg import TransformStamped
+    from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from tf2_msgs.msg import TFMessage
@@ -753,6 +759,7 @@ def cmd_bridge(args: argparse.Namespace) -> int:
 
     m = json.loads(Path(args.manifest).read_text())
     host, pairs = m["host"], [(s["port"], s["topic"]) for s in m["streams"]]
+    size = "x".join(str(v) for v in m["tile"])  # as setup configured the cameras
     names = [vehicle_ns(s) for s in m["streams"]]
 
     class Stream(threading.Thread):
@@ -761,54 +768,70 @@ def cmd_bridge(args: argparse.Namespace) -> int:
         def __init__(self, node: Any, host: str, port: int, topic: str) -> None:
             super().__init__(daemon=True)
             self.node = node
+            self.host = host
             self.port = port
             self.topic = topic
             self.frames = 0
             self.error = ""
             self.latencies_us: list[int] = []  # capture to bridge, since the last report
+            self.stopping = threading.Event()
             self.pub = node.create_publisher(CompressedVideo, topic, qos_profile_sensor_data)
-            # open_stream blocks until the stream's first keyframe, with no timeout of its own.
-            node.get_logger().info(f"{topic}: waiting for the stream on udp port {port}")
-            self.container = open_stream(host, port)
-            self.vstream = self.container.streams.video[0]
-            self.size = f"{self.vstream.width}x{self.vstream.height}"
 
         def run(self) -> None:
+            container = None
             try:
-                # The RTP demuxer hands over Annex B access units, and the simulator puts SPS/PPS
-                # ahead of every keyframe with no B-frames -- exactly what Foxglove decodes.
-                for packet in self.container.demux(self.vstream):
-                    if packet.size == 0:
-                        continue
-                    data = bytes(packet)
-                    arrived_us = time.time_ns() // NS_PER_US
-                    stamp = frame_stamp(data)
-                    if stamp is None:
-                        raise RuntimeError(
-                            "a frame came without a capture stamp: this bridge needs a PteroSim that stamps its streams"
-                        )
-                    msg = CompressedVideo()
-                    # The instant the frame shows: what /tf and PX4's state can be matched against.
-                    seconds, micros = divmod(stamp[1], US_PER_S)
-                    msg.timestamp = Time(sec=seconds, nanosec=micros * NS_PER_US)
-                    self.latencies_us.append(arrived_us - stamp[1])
-                    msg.frame_id = self.topic.strip("/").replace("/", "_")
-                    msg.format = "h264"
-                    # array.array, not bytes: Humble's uint8[] setter checks a plain sequence
-                    # element by element, and rejects an ndarray outright.
-                    msg.data = array.array("B", data)
-                    self.pub.publish(msg)
-                    self.frames += 1
+                container = open_stream(self.host, self.port)
+                vstream = container.streams.video[0]
+                self.node.get_logger().info(f"publishing {self.topic} from udp port {self.port}")
+                while not self.stopping.is_set():
+                    try:
+                        # The RTP demuxer hands over Annex B access units, and the simulator puts SPS/PPS
+                        # ahead of every keyframe with no B-frames -- exactly what Foxglove decodes.
+                        for packet in container.demux(vstream):
+                            if self.stopping.is_set() or not rclpy.ok():
+                                return
+                            if packet.size:
+                                self.publish(bytes(packet))
+                        return  # the end of the stream
+                    except av.error.ExitError:
+                        pass  # nothing for STREAM_READ_POLL_S (no stream yet, or a stopped simulation): look for a stop
             except Exception as exc:
                 # One lost stream must not take the other aircraft down with it. Deliberately
                 # broad: anything ffmpeg or the transport raises ends the stream, and the
                 # other aircraft's threads have to survive it.
                 self.error = f"{type(exc).__name__}: {exc}"
                 self.node.get_logger().error(f"{self.topic}: {self.error}")
+            finally:
+                # Here and not from the main thread: closing a container another thread reads crashes libav.
+                if container is not None:
+                    container.close()
 
-        def close(self) -> None:
-            """Close the underlying container."""
-            self.container.close()
+        def publish(self, data: bytes) -> None:
+            """Publish one access unit, stamped with the instant its frame was captured.
+
+            Args:
+            ----
+                data: The Annex B access unit as the demuxer returned it.
+
+            """
+            arrived_us = time.time_ns() // NS_PER_US
+            stamp = frame_stamp(data)
+            if stamp is None:
+                raise RuntimeError(
+                    "a frame came without a capture stamp: this bridge needs a PteroSim that stamps its streams"
+                )
+            msg = CompressedVideo()
+            # The instant the frame shows: what /tf and PX4's state can be matched against.
+            seconds, micros = divmod(stamp[1], US_PER_S)
+            msg.timestamp = Time(sec=seconds, nanosec=micros * NS_PER_US)
+            self.latencies_us.append(arrived_us - stamp[1])
+            msg.frame_id = self.topic.strip("/").replace("/", "_")
+            msg.format = "h264"
+            # array.array, not bytes: Humble's uint8[] setter checks a plain sequence
+            # element by element, and rejects an ndarray outright.
+            msg.data = array.array("B", data)
+            self.pub.publish(msg)
+            self.frames += 1
 
     rclpy.init()
     # A plain node rather than a subclass: rclpy ships no type stubs, so a base class of
@@ -816,9 +839,6 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     # to this function anyway.
     node = Node("pterosim_camera")
     streams = [Stream(node, host, port, topic) for port, topic in pairs]
-    for s in streams:
-        s.start()
-        node.get_logger().info(f"publishing {s.topic}  {s.size} from udp port {s.port}")
 
     # Rate over the last report period: an average since start would carry the stream's
     # start-up wait forever and read low.
@@ -867,7 +887,7 @@ def cmd_bridge(args: argparse.Namespace) -> int:
             hz = (s.frames - frames) / (now - since)
             last[s.topic] = (s.frames, now)
             latencies, s.latencies_us = s.latencies_us, []
-            line = f"{s.topic}  {s.frames} frames  {hz:5.1f} Hz  {s.size}  "
+            line = f"{s.topic}  {s.frames} frames  {hz:5.1f} Hz  {size}  "
             line += latency_summary("capture to bridge", latencies)
             if ns not in heard:
                 line += "  no PX4 odometry this period"
@@ -911,12 +931,18 @@ def cmd_bridge(args: argparse.Namespace) -> int:
 
     node.create_timer(1.0 / TF_RATE_HZ, publish_poses)
     try:
+        for s in streams:
+            s.start()
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass  # Ctrl+C, or SIGTERM, on which rclpy has already shut the context down
     finally:
         for s in streams:
-            s.close()
+            s.stopping.set()
+        for s in streams:
+            if s.ident is not None:  # a Ctrl+C can land between two starts
+                s.join()  # each ends within STREAM_READ_POLL_S and closes its own container
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
     return 0
