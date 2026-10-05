@@ -81,6 +81,7 @@ def existing_fleet_in_step_mode(sim: PteroSim, timings: dict[str, float]) -> Ite
         yield mode
     finally:
         with timed(timings, "exit_step_mode_s"):
+            mode.reset()  # ExitStepMode refuses while an env is crashed: every env back on its start first
             mode.close()
 
 

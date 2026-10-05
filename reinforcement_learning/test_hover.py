@@ -130,6 +130,7 @@ class FakeQuadMode:
         self.start_quat = np.array([math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)])
         self.yaw_signs = np.ones(MOTORS) if one_spin_direction else np.array([1.0, 1.0, -1.0, -1.0])
         self.crash_next = np.zeros(n, bool)
+        self.diverge_next = np.zeros(n, bool)  # crashed as Diverged, its row non-finite
         self.reset_masks: list[np.ndarray] = []
         self.step_count = 0
         self._was_reset = np.zeros(n, bool)
@@ -164,9 +165,12 @@ class FakeQuadMode:
         for _ in range(steps):
             self._physics(actions.astype(np.float64), live)
         self.step_count += steps
-        crashed, self.crash_next = self.crash_next, np.zeros(self.num_envs, bool)
+        crashed = self.crash_next | self.diverge_next
+        observations = self._observations()
+        observations[self.diverge_next] = np.nan
+        self.crash_next, self.diverge_next = np.zeros(self.num_envs, bool), np.zeros(self.num_envs, bool)
         return StepResult(
-            observations=self._observations(),
+            observations=observations,
             crashed=crashed,
             step_count=self.step_count,
             sim_time=self.step_count * self.dt,
@@ -408,6 +412,20 @@ def test_the_crashed_flag_terminates() -> None:
     assert dones.tolist() == [False, True] + [False] * (env.num_envs - 2)
     assert infos[1]["TimeLimit.truncated"] is False
     assert env.pop_episode_ends()["crashed"] == 1
+
+
+def test_a_diverged_env_ends_with_finite_rewards_and_a_bad_row_elsewhere_fails() -> None:
+    mode, env = fake_env()
+    env.reset()
+    mode.diverge_next[2] = True
+    obs, rewards, dones, infos = env.step(hover_actions(env))
+    assert dones.tolist() == [False, False, True] + [False] * (env.num_envs - 3)
+    assert infos[2]["end_reason"] == "crashed"
+    assert np.isfinite(rewards).all() and np.isfinite(obs).all()
+    original = mode._observations  # a non-finite row of an env that did not crash must not be papered over
+    mode._observations = lambda: np.full_like(original(), np.nan)  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="not crashed"):
+        env.step(hover_actions(env))
 
 
 def test_reward_peaks_at_the_target_and_actions_are_clipped() -> None:
