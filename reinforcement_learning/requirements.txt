@@ -1,0 +1,7 @@
+# Versions the hover policy was trained with. The pterosim package comes from the simulator (see the top README).
+numpy>=2.2
+gymnasium>=1.3
+stable-baselines3>=2.9
+torch>=2.14
+tensorboard>=2.21
+pytest>=8.4
