@@ -3,3 +3,6 @@ pterosim-venv/
 
 # Python bytecode cache
 __pycache__/
+
+# Training runs: checkpoints, logs and models
+runs/
