@@ -26,7 +26,7 @@ from frames import (
     to_ned,
     wrap_angle,
 )
-from pterosim.types import ActuatorMapping, StepResult
+from pterosim.types import ActuatorMapping, CrashReason, StepResult
 from stable_baselines3.common.vec_env import VecMonitor
 from step_env import (
     ACTION_SIZE,
@@ -166,12 +166,14 @@ class FakeQuadMode:
             self._physics(actions.astype(np.float64), live)
         self.step_count += steps
         crashed = self.crash_next | self.diverge_next
+        reason = np.select([self.diverge_next, self.crash_next], [CrashReason.DIVERGED, CrashReason.HULL_IMPACT])
         observations = self._observations()
         observations[self.diverge_next] = np.nan
         self.crash_next, self.diverge_next = np.zeros(self.num_envs, bool), np.zeros(self.num_envs, bool)
         return StepResult(
             observations=observations,
             crashed=crashed,
+            crash_reason=reason.astype(np.uint8),
             step_count=self.step_count,
             sim_time=self.step_count * self.dt,
         )
