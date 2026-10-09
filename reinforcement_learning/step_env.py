@@ -116,7 +116,7 @@ def step_checked(
 ) -> np.ndarray:
     """One step() call that must not crash or diverge; the named observation columns, in that order."""
     result = mode.step(motors, steps=steps)
-    bad = np.flatnonzero(result.crashed | ~np.isfinite(result.observations).all(axis=1))
+    bad = np.flatnonzero(np.asarray(result.crashed, bool) | ~np.isfinite(result.observations).all(axis=1))
     if bad.size:
         raise RuntimeError(
             f"env(s) {bad.tolist()} crashed {elapsed_s + steps * mode.dt:.2f} s into holding motors "
@@ -348,6 +348,7 @@ class StepModeVecEnv(VecEnv):  # type: ignore[misc]
         self._actions = np.zeros((n, ACTION_SIZE), np.float32)
         self.last_estimate_error: dict[str, np.ndarray] = {}
         self.last_truth = np.zeros((n, len(TRUTH_FIELDS)), np.float32)
+        self._last_rows = np.zeros((n, mode.observation_size), np.float32)
         self.sim_wall_s = 0.0
         self._ends: Counter[str] = Counter()
 
@@ -370,29 +371,39 @@ class StepModeVecEnv(VecEnv):  # type: ignore[misc]
         self._rng = np.random.default_rng(seed)
         return [seed] * self.num_envs
 
-    def _call(self, fn: Callable[[], StepResult]) -> StepResult:
+    def _call(self, fn: Callable[[], StepResult]) -> tuple[np.ndarray, np.ndarray]:
+        """One step-mode call: every env's observation row, and which envs crashed.
+
+        A crashed env's row can be non-finite (a diverged model publishes what it holds): it keeps its last finite row,
+        so the estimator and the reward stay finite through its terminal step. A non-finite row of an env that did not
+        crash is the simulator's fault and fails.
+        """
         t0 = time.perf_counter()
         result = fn()
         self.sim_wall_s += time.perf_counter() - t0
-        if not np.isfinite(result.observations).all():
-            bad = np.flatnonzero(~np.isfinite(result.observations).all(axis=1))
+        crashed = np.asarray(result.crashed, bool)
+        rows = np.array(result.observations, np.float32)
+        bad = ~np.isfinite(rows).all(axis=1)
+        if (bad & ~crashed).any():
             raise RuntimeError(
-                f"non-finite observation in env(s) {bad.tolist()}, crashed={result.crashed[bad].tolist()}"
+                f"non-finite observation in env(s) {np.flatnonzero(bad & ~crashed).tolist()}, not crashed"
             )
-        return result
+        rows[bad] = self._last_rows[bad]
+        self._last_rows = rows
+        return rows, crashed
 
     def _restart(self, mask: np.ndarray) -> np.ndarray:
         """Send the masked envs back to their start for a new episode; the truth of all envs."""
         seeds = self._rng.integers(0, INT32_SEED_LIMIT, self.num_envs)
-        result = self._call(lambda: self.mode.reset(mask=mask, seeds=seeds))
-        if result.crashed[mask].any():
-            raise RuntimeError(f"env(s) {np.flatnonzero(mask & result.crashed).tolist()} crashed right after a reset")
-        truth = result.observations[:, self._truth_cols]
+        rows, crashed = self._call(lambda: self.mode.reset(mask=mask, seeds=seeds))
+        if (mask & crashed).any():
+            raise RuntimeError(f"env(s) {np.flatnonzero(mask & crashed).tolist()} crashed right after a reset")
+        truth = rows[:, self._truth_cols]
         self._begin(mask, truth)
         self._prev_action[mask] = 0.0
         self._t[mask] = 0
         fix = self.uwb.reset(mask, seeds, truth[:, POS])
-        self.estimator.reset(mask, result.observations[:, self._sensor_cols], fix)
+        self.estimator.reset(mask, rows[:, self._sensor_cols], fix)
         return truth
 
     def _observe(self) -> np.ndarray:
@@ -414,13 +425,13 @@ class StepModeVecEnv(VecEnv):  # type: ignore[misc]
         actions = self._actions
         motors = self.actuation.motors(actions)
         motors[self.ended] = THROTTLE_MIN
-        result = self._call(lambda: self.mode.step(motors, steps=STEPS_PER_ACTION))
-        truth = self.last_truth = result.observations[:, self._truth_cols]
-        self.estimator.step(result.observations[:, self._sensor_cols], *self.uwb.measure(truth[:, POS]))
+        rows, crashed = self._call(lambda: self.mode.step(motors, steps=STEPS_PER_ACTION))
+        truth = self.last_truth = rows[:, self._truth_cols]
+        self.estimator.step(rows[:, self._sensor_cols], *self.uwb.measure(truth[:, POS]))
         self.last_estimate_error = self.estimator.errors(body_to_ned(truth[:, QUAT]), truth[:, POS], truth[:, VEL])
         self._prev_action = actions
         self._t += 1
-        rewards, reasons = self._score(truth, result.crashed)
+        rewards, reasons = self._score(truth, crashed)
         terminated = np.logical_or.reduce(list(reasons.values()))
         truncated = (self._t >= self._max_episode_steps) & ~terminated
         dones = (terminated | truncated) & ~self.ended
