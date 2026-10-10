@@ -134,6 +134,7 @@ class FakeQuadMode:
         self.reset_masks: list[np.ndarray] = []
         self.step_count = 0
         self._was_reset = np.zeros(n, bool)
+        self._time = np.zeros(n)  # each env's flight-model time, s, which its reset starts over
         self._pos = np.zeros((n, 3))
         self._vel = np.zeros((n, 3))
         self._quat = np.tile(self.start_quat, (n, 1))
@@ -164,6 +165,7 @@ class FakeQuadMode:
             self._restart(mask)
         for _ in range(steps):
             self._physics(actions.astype(np.float64), live)
+        self._time[live] += steps * self.dt
         self.step_count += steps
         crashed = self.crash_next | self.diverge_next
         reason = np.select([self.diverge_next, self.crash_next], [CrashReason.DIVERGED, CrashReason.HULL_IMPACT])
@@ -175,7 +177,7 @@ class FakeQuadMode:
             crashed=crashed,
             crash_reason=reason.astype(np.uint8),
             step_count=self.step_count,
-            sim_time=self.step_count * self.dt,
+            env_sim_time=self._time.copy(),
         )
 
     def reset(self, mask: Any = None, seeds: Any = None) -> StepResult:
@@ -185,6 +187,7 @@ class FakeQuadMode:
 
     def _restart(self, mask: np.ndarray) -> None:
         self._was_reset |= mask
+        self._time[mask] = 0.0
         self._pos[mask] = 0.0
         self._vel[mask] = 0.0
         self._quat[mask] = self.start_quat
