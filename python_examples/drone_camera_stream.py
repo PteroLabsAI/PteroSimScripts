@@ -1,6 +1,6 @@
 """Turn on a drone camera's video stream from Python and watch it.
 
-A camera sensor with ``stream`` on sends RTP/H.264 to udp://<host>:<stream_port + instance id> for as
+A camera sensor with ``stream`` on sends RTP/H.264 to udp://<host>:<stream_port + 2 * instance id> for as
 long as the simulation runs -- the same stream a ground station shows. With PX4 or ArduPilot SITL
 connected, the simulator announces the camera on the autopilot's link (MAVLink camera protocol) and
 QGroundControl / Mission Planner pick the video up on their own; without an autopilot, set QGC's
@@ -18,7 +18,7 @@ Options:
     --aircraft   Aircraft to spawn when the sim is empty (default x500)
     --instance   Use the aircraft with this instance_id when one is already there (default 0)
     --camera     Camera sensor name (default: the first camera the aircraft carries)
-    --port       Base UDP port; the aircraft's instance id is added (default 5600)
+    --port       Base UDP port; two per instance id are added (default 5600)
     --host       Where to send it -- the ground station's address (default 127.0.0.1)
     --fps        Stream frame rate (default 30; the engine's own frame rate is the ceiling)
     --width/--height  Frame size (default 1280x720)
@@ -44,6 +44,7 @@ except ImportError:
 
 GRPC_ADDRESS = "localhost:10010"
 ESC_KEY = 27
+STREAM_PORTS_PER_INSTANCE = 2  # CameraSensorComponent.h: an aircraft's RTP and RTCP ports, stream_port + 2*instance_id
 
 # OpenCV's ffmpeg reads its options from the environment once, when the DLL loads -- before this script can
 # set them -- so a viewer run re-launches itself with them in place (os.execve is not a real exec on Windows).
@@ -176,7 +177,7 @@ def main() -> None:
         stream_port=args.port,
         stream_host=args.host,
     )
-    port = args.port + drone.instance_id
+    port = args.port + STREAM_PORTS_PER_INSTANCE * drone.instance_id
     sim.start()
     print(f"Streaming '{camera.name}' {args.width}x{args.height}@{args.fps} -> udp://{args.host}:{port}")
     print(f"QGroundControl: Video Source = UDP h.264 Video Stream, port {port}. Ctrl-C stops the simulation.")

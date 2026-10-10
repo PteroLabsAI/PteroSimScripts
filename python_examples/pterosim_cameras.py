@@ -37,7 +37,7 @@ of the fleet -- import it in Foxglove instead of arranging the panels by hand.
 WHY IT LOOKS THE WAY IT DOES
 
 The simulator already has a camera pipeline: its own encoder sends RTP/H.264 to
-udp://<host>:<stream_port + instance_id>, the same stream a ground station displays. This
+udp://<host>:<stream_port + 2*instance_id>, the same stream a ground station displays. This
 consumes that stream instead of pulling frames over gRPC, which is what
 python_examples/drone_camera_display.py does. That matters: a gRPC pull is a synchronous GPU
 readback on the sim's render path, paid for every frame pulled, while reading a push stream
@@ -49,11 +49,9 @@ agrees with the simulator's.
 
 Two details that are easy to get wrong:
 
-  * Ports step by two, not one. ffmpeg binds port+1 alongside every RTP port for RTCP, so a
-    decoder on 5600 also holds 5601 -- which would be the next aircraft's own stream. The SDK
-    derives the port as stream_port + instance_id, so giving each aircraft
-    stream_port = BASE + instance_id lands the real ports BASE + 2*instance_id and the RTCP
-    ports fall on free ones.
+  * Every aircraft gets the same stream_port, and its stream is not on it. ffmpeg binds port+1
+    alongside every RTP port for RTCP, so the simulator moves each aircraft up a pair: RTP on
+    stream_port + 2*instance_id, RTCP on the port above.
 
   * The SDP file needs format="sdp" and protocol_whitelist. Payload type 96 says nothing on
     its own, ffmpeg takes such a description only from a file, and without the whitelist it
@@ -105,6 +103,7 @@ FASTDDS_PROFILE = str(Path(__file__).resolve().parent / "fastdds_wsl.xml")
 # PX4's onboard link for an API listens on this + instance id (px4-rc.mavlink).
 PX4_API_PORT = 14580
 HIL_BASE_PORT = 4560  # PteroSim's PX4 HIL server listens on this + instance id
+STREAM_PORTS_PER_INSTANCE = 2  # CameraSensorComponent.h: an aircraft's RTP and RTCP ports, stream_port + 2*instance_id
 PX4_AIRFRAME = 22100  # the id x500's firmwares/px4_x500 is installed under in the PX4 tree
 GCS_SYSTEM_ID = 245  # a ground station's id, clear of the vehicles' 1..N
 HEARTBEAT_PERIOD_S = 1.0  # PX4 declares a GCS lost after a few silent seconds and will not arm
@@ -469,8 +468,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             # keep looking at each other rather than wherever the flight controller parks them.
             drone.set_gimbal_source("api")
 
-            # stream_port is per aircraft, so the real port steps by two.
-            stream_port = args.base_port + i
+            stream_port = args.base_port
             drone.set_sensor_param(
                 cam.name,
                 update_hz=args.fps,
@@ -484,11 +482,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 "instance_id": i,
                 "aircraft": getattr(drone, "aircraft_name", None) or args.aircraft,
                 "camera": cam.name,
-                "port": stream_port + i,
+                "port": stream_port + STREAM_PORTS_PER_INSTANCE * i,
             }
             topic = stream["topic"] = f"/{vehicle_ns(stream)}/{cam.name}/compressed_video"
             streams.append(stream)
-            print(f"  instance {i}: {cam.name} -> udp://{host}:{stream_port + i}  {topic}")
+            print(f"  instance {i}: {cam.name} -> udp://{host}:{stream['port']}  {topic}")
 
         sim.start()
     finally:
