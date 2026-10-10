@@ -12,8 +12,8 @@ Usage:
 Options:
     --aircraft      Aircraft class to spawn (default F450)
     --camera        Camera sensor name (default: the first camera on the aircraft)
-    --width         Camera frame width (default 1280)
-    --height        Camera frame height (default 720)
+    --width         Camera frame width, set before the start (default 1280)
+    --height        Camera frame height, set before the start (default 720)
     --instance      Use existing aircraft with this instance_id (default 0)
     --max-frames    Auto-exit after N frames (0 = run indefinitely)
     --report-every  Print latency stats every N frames (default 30)
@@ -68,8 +68,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Display PteroSim drone camera feed")
     parser.add_argument("--aircraft", default="F450", help="Aircraft class to spawn (default F450)")
     parser.add_argument("--camera", default="", help="Camera sensor name (default: first camera found)")
-    parser.add_argument("--width", type=int, default=1280, help="Camera frame width")
-    parser.add_argument("--height", type=int, default=720, help="Camera frame height")
+    parser.add_argument("--width", type=int, default=1280, help="Camera frame width, set before the start")
+    parser.add_argument("--height", type=int, default=720, help="Camera frame height, set before the start")
     parser.add_argument("--instance", type=int, default=0, help="Use existing aircraft with this instance_id")
     parser.add_argument("--max-frames", type=int, default=0, help="Auto-exit after N frames (0 = run indefinitely)")
     parser.add_argument("--report-every", type=int, default=30, help="Print latency stats every N frames")
@@ -98,14 +98,6 @@ def main() -> None:
             drone = sim.get_aircraft(args.instance)
             print(f"Using existing aircraft instance_id={args.instance}")
 
-        # Start the simulation unless it already runs
-        if not status.is_running:
-            print("Starting simulation ...")
-            sim.set_time_scale(1.0)
-            sim.start()
-            we_started = True
-            print("  Simulation started.")
-
         # Check camera sensor exists
         cameras = [s for s in drone.list_sensors() if s.type == "camera"]
         if args.camera:
@@ -116,8 +108,22 @@ def main() -> None:
         camera = cameras[0]
         print(f"Camera sensor: {camera.name} ({camera.update_hz} Hz)")
 
+        # The camera's size is set before the start; a pull takes whatever it is
+        if not status.is_running:
+            drone.set_sensor_param(camera.name, image_width=args.width, image_height=args.height)
+            print("Starting simulation ...")
+            sim.set_time_scale(1.0)
+            sim.start()
+            we_started = True
+            print("  Simulation started.")
+        else:
+            print(
+                f"Simulation already runs: --width/--height are not applied, the camera keeps "
+                f"{camera.fields['image_width']}x{camera.fields['image_height']}"
+            )
+
         # Pull frames to the screen
-        print(f"\nDisplaying camera feed {args.width}x{args.height} ...")
+        print("\nDisplaying camera feed ...")
         print("Press 'q' or Esc to quit.\n")
 
         window = "PteroSim Drone Camera"
@@ -132,7 +138,7 @@ def main() -> None:
         while True:
             try:
                 t_req = time.perf_counter()
-                frame = drone.camera(camera.name, width=args.width, height=args.height, timeout=2.0)
+                frame = drone.camera(camera.name, timeout=2.0)
                 rtt_ms = (time.perf_counter() - t_req) * 1000.0
                 errors = 0
             except Exception as e:
