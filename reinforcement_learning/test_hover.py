@@ -553,6 +553,14 @@ def test_uwb_fixes_are_seeded_noisy_and_taken_at_the_ticks(monkeypatch: pytest.M
         np.testing.assert_allclose(fix, np.tile(speed * tick, (n, 1)), atol=1e-9)  # the truth at the last tick
 
 
+def test_an_agent_faster_than_the_uwb_gets_each_tick_once() -> None:
+    agent_hz, seconds = 100.0, 30  # twice the UWB rate, where time summed in 0.01 s steps lands just under some ticks
+    uwb = UwbPositioning(1, 1.0 / agent_hz)
+    uwb.reset(np.ones(1, bool), np.array([7]), np.zeros((1, 3)))
+    new = sum(int(uwb.measure(np.zeros((1, 3)))[1][0]) for _ in range(round(seconds * agent_hz)))
+    assert new == seconds * estimator.LPS_RATE_HZ
+
+
 def test_the_estimator_tracks_a_climb_and_a_tilt() -> None:
     n = 4
     mode = FakeQuadMode(n, start_yaw_deg=FAKE_START_YAW_DEG)

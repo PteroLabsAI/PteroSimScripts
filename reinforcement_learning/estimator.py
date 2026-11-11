@@ -122,8 +122,9 @@ class UwbPositioning:
     def measure(self, pos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Every env's fix after one agent step, given its truth position now, and which fixes are new."""
         t = self._t + self._agent_dt
-        tick = np.floor(t * LPS_RATE_HZ + TICK_ROUNDING) / LPS_RATE_HZ
-        new = tick > self._t
+        ticks = np.floor(t * LPS_RATE_HZ + TICK_ROUNDING)
+        tick = ticks / LPS_RATE_HZ
+        new = ticks > np.floor(self._t * LPS_RATE_HZ + TICK_ROUNDING)  # by count: summed time can sit just under a tick
         fraction = ((tick - self._t) / self._agent_dt)[:, None]
         fresh = self._prev + fraction * (pos - self._prev) + self._noise(new)
         self._fix[new] = fresh[new]
