@@ -4,6 +4,8 @@ Prerequisites: stopped, empty PteroSim scene; installed aircraft; Linux PX4 SITL
 build (Windows: WSL Ubuntu-24.04 with python3). Choose an unobstructed spawn area.
 A licence that allows the default four aircraft (three flyers and the camera stand),
 and a simulator newer than v0.5.0, whose cameras serve raw_stream frames through shared memory.
+The simulator runs on this machine. standard_vtol needs the PteroSimAircrafts whose PX4 airframe
+sets CA_ROTOR4_AX: without it PX4 spins the pusher at arming and its blade strikes the ground.
 
 Install into the active virtual environment:
     python -m pip install pterosim numpy opencv-python pymavlink ultralytics huggingface-hub lap
@@ -178,7 +180,10 @@ CAMERA_FOV_DEG = 60.0
 LANE_SPACING_M = 3.5
 CAMERA_TIMEOUT_S = 10.0  # chosen: the camera has stopped if no frame came for this long
 RAW_STREAM_HOST = "127.0.0.1"  # the camera's raw_stream_host default; shared memory needs the simulator's machine
+LOCAL_HOSTS = ("localhost", RAW_STREAM_HOST)
+RAW_STREAM_PORT = 5710  # chosen: the SDK's RawStream example port; any free TCP port works
 RAW_STREAM_PORTS_PER_INSTANCE = 2  # BaseRenderSensor.h SensorOutputPortsPerInstance: raw_stream_port + 2*instance_id
+TRACKER = "bytetrack.yaml"
 # Chosen: lifts the lens above the stand and tilts it up so the hovering aircraft sit against the sky.
 CAMERA_HEIGHT_M = 3.0
 CAMERA_PITCH_DEG = 20.0
@@ -444,11 +449,10 @@ class Sitl:
 
 
 def annotate(cv2: Any, image: Any, result: Any) -> tuple[Any, list[dict[str, Any]]]:
-    """Draw only model detections; never substitute simulator boxes for YOLO."""
-    canvas = image.copy()
+    """Draw only model detections onto the frame; never substitute simulator boxes for YOLO."""
     detections: list[dict[str, Any]] = []
     if result.boxes is None:
-        return canvas, detections
+        return image, detections
     for box in result.boxes:
         class_id = int(box.cls.item())
         label = result.names[class_id]
@@ -458,14 +462,14 @@ def annotate(cv2: Any, image: Any, result: Any) -> tuple[Any, list[dict[str, Any
         x1, y1, x2, y2 = [round(value) for value in coords]
         color = COLORS[class_id % len(COLORS)]
         text = f"{label} {confidence:.0%}" + (f" ID {track_id}" if track_id is not None else "")
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(canvas, text, (max(0, x1), max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(image, text, (max(0, x1), max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         detections.append({"class": label, "confidence": confidence, "track_id": track_id, "xyxy": coords})
-    return canvas, detections
+    return image, detections
 
 
 def record(args: argparse.Namespace, stream: Any, model: Any, flight: Flight, sitl: Sitl, output: Path) -> int:
-    """Write annotated MP4 in sim time, every captured frame once, with capture times in JSONL."""
+    """Write annotated MP4 in sim time, each detected frame held until the next, with capture times in JSONL."""
     import cv2
 
     writer = cv2.VideoWriter(
@@ -475,6 +479,7 @@ def record(args: argparse.Namespace, stream: Any, model: Any, flight: Flight, si
         writer.release()
         raise RuntimeError("Cannot open MP4 encoder; use an OpenCV build with FFmpeg")
     start: float | None = None
+    previous: Any = None
     written = 0
     detected = 0
     try:
@@ -493,7 +498,7 @@ def record(args: argparse.Namespace, stream: Any, model: Any, flight: Flight, si
                 result = model.track(
                     image,
                     persist=True,
-                    tracker="bytetrack.yaml",
+                    tracker=TRACKER,
                     conf=args.conf,
                     imgsz=args.imgsz,
                     device=args.device,
@@ -515,23 +520,24 @@ def record(args: argparse.Namespace, stream: Any, model: Any, flight: Flight, si
                     cv2.putText(
                         canvas, "No YOLO detections", (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 160, 255), 2
                     )
-                # A frame holds the video until the next one the detector takes, so the video keeps sim time.
-                target_count = max(written + 1, math.ceil(elapsed * args.fps))
-                for _ in range(target_count - written):
-                    writer.write(canvas)
+                # The previous frame holds the video up to this one's sim time, so the video keeps sim time.
+                slot = max(written, round(elapsed * args.fps))
+                for _ in range(slot - written):
+                    writer.write(previous)
+                writer.write(canvas)
+                previous = canvas
+                written = slot + 1
                 log.write(
                     json.dumps(
                         {
                             "sim_seconds": frame.sim_time,
                             "sequence": frame.frame,
-                            "video_frame_start": written,
-                            "video_frame_end": target_count,
+                            "video_frame": slot,
                             "detections": detections,
                         }
                     )
                     + "\n"
                 )
-                written = target_count
                 if not args.no_preview:
                     cv2.imshow("PteroSim - PX4 drone detection", canvas)
                     if cv2.waitKey(1) & 0xFF in (27, ord("q")):
@@ -540,8 +546,6 @@ def record(args: argparse.Namespace, stream: Any, model: Any, flight: Flight, si
         writer.release()
         if not args.no_preview:
             cv2.destroyAllWindows()
-    if not written:
-        raise RuntimeError("Camera returned no frames")
     if stream.dropped:
         print(f"{stream.dropped} camera frames were overwritten before the detector took them")
     if not detected:
@@ -558,7 +562,9 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--sim-host", default="127.0.0.1", help="Simulator address as seen by Linux PX4")
     ap.add_argument("--api-host", default="127.0.0.1", help="Python address as seen by Linux PX4")
     ap.add_argument("--api-port", type=int, default=15540)
-    ap.add_argument("--raw-stream-port", type=int, default=5710, help="Camera frames' port before the instance offset")
+    ap.add_argument(
+        "--raw-stream-port", type=int, default=RAW_STREAM_PORT, help="Camera frames' port before the instance offset"
+    )
     ap.add_argument("--wsl-distro", default="Ubuntu-24.04")
     ap.add_argument("--px4-build", default="~/Documents/PX4-Autopilot/build/px4_sitl_default")
     ap.add_argument("--aircraft-root", type=Path, default=HERE.parents[1] / "PteroSimAircrafts")
@@ -603,6 +609,8 @@ def main() -> None:
         )
     ):
         raise ValueError("Confidence must be in (0,1]; duration, rates, timeout and sizes must be positive")
+    if args.address.rsplit(":", 1)[0] not in LOCAL_HOSTS:
+        raise ValueError(f"--address {args.address}: frames come through shared memory, so run on the sim's machine")
     import numpy as np
     import torch
     from huggingface_hub import hf_hub_download
@@ -613,7 +621,8 @@ def main() -> None:
     weights = args.weights or hf_hub_download("TomSmail/drone-yolo-v1", "best.pt")
     model = YOLO(str(weights))
     # Warm up here: the first inference loads the device for seconds, which would hold the video's first frame.
-    model.predict(np.zeros((args.height, args.width, 3), np.uint8), imgsz=args.imgsz, device=args.device, verbose=False)
+    blank = np.zeros((args.height, args.width, 3), np.uint8)
+    model.predict(blank, imgsz=args.imgsz, device=args.device, tracker=TRACKER, verbose=False)
     print(f"Detector classes: {model.names}; these are visual predictions, not aircraft model names")
     output = args.output.resolve() / time.strftime("%Y%m%d-%H%M%S")
     output.mkdir(parents=True, exist_ok=False)
