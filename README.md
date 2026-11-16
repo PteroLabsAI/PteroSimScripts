@@ -2,9 +2,6 @@
 
 This repository holds **Python scripts, examples, and automation** for PteroSim: RL loops, tooling, and utilities that use the **gRPC Python SDK** (`pterosim`).
 
-For a mixed-drone PX4 flight demo with live YOLO rectangles and annotated MP4 recording,
-see [the drone detection demo](python_examples/drone_detection_demo.md).
-
 Get the simulator from **[PteroSim v0.1.0 open beta (GitHub Release)](https://github.com/PteroLabsAI/PteroSim-UAV-Simulator/releases/tag/v0.1.0)** — download the build for your OS and read the release notes there.
 
 ---

@@ -6,6 +6,3 @@ __pycache__/
 
 # Training runs: checkpoints, logs and models
 runs/
-
-# Generated detection videos, logs and private PX4 resources
-recordings/

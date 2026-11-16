@@ -1,7 +1,27 @@
-"""Spawn a camera stand and a mixed PX4 fleet; record tracked YOLO boxes.
+"""Fly PX4 drones past a camera and record YOLO tracking rectangles.
 
-See drone_detection_demo.md for Windows/WSL and Linux commands and limitations.
-Flight uses real PX4 Offboard MAVLink, following XTDrone's streamed-setpoint design.
+Prerequisites: stopped, empty PteroSim scene; installed aircraft; Linux PX4 SITL
+build (Windows: WSL Ubuntu-24.04 with python3). Choose an unobstructed spawn area.
+
+Install into the active virtual environment:
+    python -m pip install pterosim numpy opencv-python pymavlink ultralytics huggingface-hub lap
+If pterosim is not published on your package index, install the simulator SDK:
+    python -m pip install -e <simulator>/Plugins/PteroSimScripting/SDK/python
+
+Windows/WSL NAT, from PowerShell:
+    $simHostIp = (wsl -d Ubuntu-24.04 --exec bash -lc "ip route show default").Trim().Split()[2]
+    python python_examples/drone_detection_demo.py --sim-host $simHostIp --api-host $simHostIp --y 8000
+
+Use --aircraft-root <simulator>/PteroSim/PteroSimAircrafts for downloaded builds.
+Linux on the same host: python python_examples/drone_detection_demo.py
+Press Q/Escape in the preview to finish. Output: runs/drone-detection/<timestamp>/detections.mp4.
+PX4 runtime copies, detection timestamps and logs stay alongside the recording.
+
+F450/X500 are the defaults. Optional VTOL models failed takeoff in the tested
+v0.5.0 build. TomSmail detected the rendered quads but mislabeled them fixed-wing
+and sometimes detected the moon: use --weights for suitable custom weights.
+F450's gripper binding must match its Visual.xml part name (e.g. gripper_1).
+Flight follows XTDrone's streamed Offboard setpoints, using pymavlink without ROS.
 """
 
 from __future__ import annotations
@@ -13,15 +33,128 @@ import contextlib
 import json
 import math
 import os
+import shlex
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from drone_detection_px4 import LocalPoseNed, Px4Vehicle
+POSITION_AND_YAW_MASK = 0x09F8
+
+
+def _mavutil() -> Any:
+    """Load MAVLink only when a flight operation needs it."""
+    from pymavlink import mavutil
+
+    return mavutil
+
+
+@dataclass(frozen=True)
+class LocalPoseNed:
+    """Local position in metres (north, east, down) and yaw in radians."""
+
+    north_m: float
+    east_m: float
+    down_m: float
+    yaw_rad: float
+
+
+class Px4Vehicle:
+    """One connection to a PX4 API endpoint, separate from its simulator HIL link."""
+
+    def __init__(self, connection: Any, *, name: str) -> None:
+        """Keep the heartbeat's target identity and latest local pose."""
+        self.connection = connection
+        self.name = name
+        self.target_system = int(connection.target_system)
+        self.target_component = int(connection.target_component or 1)
+        self._position: tuple[float, float, float] | None = None
+        self._yaw: float | None = None
+
+    @classmethod
+    def connect(cls, endpoint: str, *, name: str, heartbeat_timeout_s: float = 20.0) -> Px4Vehicle:
+        """Wait for PX4 on an API UDP endpoint, never on HIL TCP port 4560."""
+        connection = _mavutil().mavlink_connection(endpoint, source_system=250, autoreconnect=True)
+        try:
+            if connection.wait_heartbeat(timeout=heartbeat_timeout_s) is None:
+                raise TimeoutError(f"{name}: no PX4 heartbeat on {endpoint}")
+            return cls(connection, name=name)
+        except Exception:
+            connection.close()
+            raise
+
+    def close(self) -> None:
+        """Release the API socket."""
+        self.connection.close()
+
+    def wait_pose(self, timeout_s: float = 15.0) -> LocalPoseNed:
+        """Read initial estimator position and attitude, with a bounded wait."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            while True:
+                message = self.connection.recv_match(type=["LOCAL_POSITION_NED", "ATTITUDE"], blocking=False)
+                if message is None:
+                    break
+                if message.get_srcSystem() != self.target_system:
+                    continue
+                if message.get_type() == "LOCAL_POSITION_NED":
+                    self._position = (float(message.x), float(message.y), float(message.z))
+                elif message.get_type() == "ATTITUDE":
+                    self._yaw = float(message.yaw)
+            if self._position is not None and self._yaw is not None:
+                return LocalPoseNed(*self._position, self._yaw)
+            time.sleep(0.01)
+        raise TimeoutError(f"{self.name}: no LOCAL_POSITION_NED/ATTITUDE telemetry")
+
+    def send_position_target(self, north_m: float, east_m: float, down_m: float, yaw_rad: float) -> None:
+        """Stream a position and yaw target in PX4's own local NED frame."""
+        self.connection.mav.set_position_target_local_ned_send(
+            int(time.monotonic() * 1000.0) & 0xFFFFFFFF,
+            self.target_system,
+            self.target_component,
+            _mavutil().mavlink.MAV_FRAME_LOCAL_NED,
+            POSITION_AND_YAW_MASK,
+            float(north_m),
+            float(east_m),
+            float(down_m),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            float(yaw_rad),
+            0.0,
+        )
+
+    def set_mode(self, mode: str) -> None:
+        """Select a PX4 mode using pymavlink's PX4-aware command helper."""
+        name = mode.upper()
+        if name not in (self.connection.mode_mapping() or {}):
+            raise RuntimeError(f"{self.name}: PX4 mode {mode!r} is unavailable")
+        self.connection.set_mode(name)
+
+    def arm(self) -> None:
+        """Request arming while retaining PX4's preflight checks."""
+        self.connection.mav.command_long_send(
+            self.target_system,
+            self.target_component,
+            _mavutil().mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )
+
 
 HERE = Path(__file__).resolve().parent
 VEHICLES = ("F450", "x500")
@@ -151,6 +284,57 @@ class Flight:
             self.thread.join(timeout=20.0)
 
 
+def px4_worker(arguments: list[str]) -> None:
+    """Prepare private PX4 resources and replace this worker with the firmware."""
+    build_arg, firmware_arg, runtime_arg, instance_arg, sim_host, api_host, api_port_arg = arguments
+    build = Path(build_arg).expanduser().resolve()
+    binary = build / "bin/px4"
+    if not binary.is_file() or not (build / "etc").is_dir():
+        raise FileNotFoundError(f"Build PX4 SITL first: {build}")
+    runtime = Path(runtime_arg).resolve()
+    resources = runtime / "etc"
+    runtime.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(build / "etc", resources)
+    airframe = resources / "init.d-posix/airframes/31000_pterosim_detection"
+    airframe.write_text(
+        Path(firmware_arg).read_text().replace("\r", "")
+        + "\nparam set-default COM_RC_IN_MODE 4\nparam set-default COM_DISARM_PRFLT 30\n"
+    )
+    instance = int(instance_arg)
+    api_port = int(api_port_arg)
+    startup = resources / "init.d-posix/px4-rc.mavlink"
+    lines = startup.read_text().splitlines()
+    matches = [
+        i for i, line in enumerate(lines) if line.startswith("mavlink start ") and "udp_offboard_port_local" in line
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("Cannot locate PX4's API link in px4-rc.mavlink")
+    lines[matches[0]] = (
+        f"mavlink start -x -u {14600 + instance} -o {api_port} -t {shlex.quote(api_host)} -r 1000000 -m onboard"
+    )
+    startup.write_text("\n".join(lines) + "\n")
+    (runtime / "px4.pid").write_text(str(os.getpid()))
+    environment = {
+        **os.environ,
+        "PX4_SYS_AUTOSTART": "31000",
+        "PX4_SIM_MODEL": "none_iris",
+        "PX4_SIM_HOSTNAME": sim_host,
+        "PX4_LOCKSTEP": "1",
+        "PX4_SIM_SPEED_FACTOR": "1",
+    }
+    os.chdir(runtime)
+    os.execve(str(binary), [str(binary), "-i", str(instance), "-d", str(resources)], environment)
+
+
+def stop_px4_worker(pid_file: str) -> None:
+    """Signal only the firmware process recorded by this run's worker."""
+    with contextlib.suppress(FileNotFoundError, ProcessLookupError):
+        pid = int(Path(pid_file).read_text().strip())
+        if pid <= 1:
+            raise ValueError("Invalid PX4 process ID")
+        os.kill(pid, signal.SIGTERM)
+
+
 class Sitl:
     """Launch private Linux PX4 resources, optionally through Windows WSL."""
 
@@ -180,8 +364,9 @@ class Sitl:
         runtime_linux = self.linux_path(runtime)
         command = [
             *self.prefix,
-            "bash",
-            self.linux_path(HERE / "drone_detection_px4.sh"),
+            "python3" if self.prefix else sys.executable,
+            self.linux_path(Path(__file__).resolve()),
+            "--px4-worker",
             self.args.px4_build,
             self.linux_path(firmware),
             runtime_linux,
@@ -210,9 +395,9 @@ class Sitl:
                     subprocess.run(
                         [
                             *self.prefix,
-                            "bash",
-                            self.linux_path(HERE / "drone_detection_px4.sh"),
-                            "--stop",
+                            "python3",
+                            self.linux_path(Path(__file__).resolve()),
+                            "--px4-stop",
                             f"{runtime}/px4.pid",
                         ],
                         timeout=5,
@@ -334,7 +519,7 @@ def record(args: argparse.Namespace, camera: Any, model: Any, flight: Flight, si
 
 def parser() -> argparse.ArgumentParser:
     """Expose scene, firmware and detector settings without editing source."""
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--address", default="localhost:10010")
     ap.add_argument("--sim-host", default="127.0.0.1", help="Simulator address as seen by Linux PX4")
     ap.add_argument("--api-host", default="127.0.0.1", help="Python address as seen by Linux PX4")
@@ -363,7 +548,7 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--y", type=float, default=0.0)
     ap.add_argument("--z", type=float, default=100.0)
     ap.add_argument("--no-preview", action="store_true")
-    ap.add_argument("--output", type=Path, default=HERE.parent / "recordings")
+    ap.add_argument("--output", type=Path, default=HERE.parent / "runs" / "drone-detection")
     return ap
 
 
@@ -481,4 +666,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--px4-worker"]:
+        px4_worker(sys.argv[2:])
+    elif sys.argv[1:2] == ["--px4-stop"]:
+        stop_px4_worker(sys.argv[2])
+    else:
+        main()

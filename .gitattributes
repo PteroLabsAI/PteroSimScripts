@@ -1,2 +1,0 @@
-# WSL executes this launcher directly from the Windows checkout.
-python_examples/drone_detection_px4.sh text eol=lf
