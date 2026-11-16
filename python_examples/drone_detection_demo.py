@@ -2,6 +2,8 @@
 
 Prerequisites: stopped, empty PteroSim scene; installed aircraft; Linux PX4 SITL
 build (Windows: WSL Ubuntu-24.04 with python3). Choose an unobstructed spawn area.
+A licence that allows the default four aircraft (three flyers and the camera stand),
+and a simulator newer than v0.5.0, whose cameras serve raw_stream frames through shared memory.
 
 Install into the active virtual environment:
     python -m pip install pterosim numpy opencv-python pymavlink ultralytics huggingface-hub lap
@@ -14,13 +16,15 @@ Windows/WSL NAT, from PowerShell:
 
 Use --aircraft-root <simulator>/PteroSim/PteroSimAircrafts for downloaded builds.
 Linux on the same host: python python_examples/drone_detection_demo.py
+With an NVIDIA GPU add --device 0: on the CPU the detector runs a few frames a second.
 Press Q/Escape in the preview to finish. Output: runs/drone-detection/<timestamp>/detections.mp4.
 PX4 runtime copies, detection timestamps and logs stay alongside the recording.
 
-F450/X500 are the defaults. Optional VTOL models failed takeoff in the tested
-v0.5.0 build. TomSmail detected the rendered quads but mislabeled them fixed-wing
-and sometimes detected the moon: use --weights for suitable custom weights.
-F450's gripper binding must match its Visual.xml part name (e.g. gripper_1).
+By default standard_vtol hovers between two x500; each rises, sinks and slowly turns in its lane.
+standard_vtol stays in multicopter mode, so its wing is in the shot next to the quads.
+The detector is TomSmail/drone-yolo-v1 (CC-BY-4.0): quadcopter and fixed-wing classes.
+It calls standard_vtol fixed-wing; x500 quadcopter or fixed-wing by the angle, F450 nearly always
+fixed-wing. --weights takes your own instead.
 Flight follows XTDrone's streamed Offboard setpoints, using pymavlink without ROS.
 """
 
@@ -157,32 +161,58 @@ class Px4Vehicle:
 
 
 HERE = Path(__file__).resolve().parent
-VEHICLES = ("F450", "x500")
+VEHICLES = ("F450", "x500", "standard_vtol")
+# The plane between two drones; TomSmail called F450 fixed-wing in 98% of frames here, x500 sometimes a quadcopter.
+FLEET = ("x500", "standard_vtol", "x500")
 COLORS = ((60, 230, 60), (30, 160, 255), (255, 160, 60), (220, 70, 220))
 SETPOINT_HZ = 30.0
 TELEMETRY_MAX_AGE = 3.0
 PX4_MAIN_MODE_OFFBOARD = 6
 ARMING_TIMEOUT = 40.0
 COMMAND_PERIOD = 2.0
+CM_PER_M = 100.0
+# Chosen: at CAMERA_FOV_DEG a 0.45 m F450 spans ~40 px of 1280 here, standard_vtol's 2.14 m wing ~200 px.
+TARGET_DISTANCE_M = 12.0
+CAMERA_FOV_DEG = 60.0
+# Chosen: standard_vtol's 2.14 m wing beside a quad still leaves ~2 m between them.
+LANE_SPACING_M = 3.5
+CAMERA_TIMEOUT_S = 10.0  # chosen: the camera has stopped if no frame came for this long
+RAW_STREAM_HOST = "127.0.0.1"  # the camera's raw_stream_host default; shared memory needs the simulator's machine
+RAW_STREAM_PORTS_PER_INSTANCE = 2  # BaseRenderSensor.h SensorOutputPortsPerInstance: raw_stream_port + 2*instance_id
+# Chosen: lifts the lens above the stand and tilts it up so the hovering aircraft sit against the sky.
+CAMERA_HEIGHT_M = 3.0
+CAMERA_PITCH_DEG = 20.0
+# Chosen: lane altitudes above each take-off point, one metre apart from left to right.
+BASE_ALTITUDE_M = 6.0
+ALTITUDE_STEP_M = 1.0
+CLIMB_S = 10.0
+# Chosen: each aircraft rises and sinks in its lane and turns on the spot, so the camera sees it from every side.
+BOB_M = 1.0
+BOB_PERIOD_S = 12.0
+TURN_PERIOD_S = 30.0
 
 
 @dataclass(frozen=True)
 class Route:
     """Displacement from each vehicle's independently calibrated PX4 origin."""
 
-    altitude: float
-    phase: float
+    altitude_m: float
+    phase_rad: float
 
-    def target(self, anchor: LocalPoseNed, elapsed: float) -> LocalPoseNed:
-        """Climb smoothly, then fly a small ellipse inside a separate viewing lane."""
-        climb = min(max(elapsed / 10.0, 0.0), 1.0)
+    def target(self, anchor: LocalPoseNed, elapsed_s: float) -> LocalPoseNed:
+        """Climb smoothly, then bob and turn over the take-off point: no move across the lanes."""
+        climb = min(max(elapsed_s / CLIMB_S, 0.0), 1.0)
         climb = climb * climb * (3.0 - 2.0 * climb)
-        angle = 2.0 * math.pi * max(0.0, elapsed - 10.0) / 24.0
+        hovered_s = max(0.0, elapsed_s - CLIMB_S)
+        angle = 2.0 * math.pi * hovered_s / BOB_PERIOD_S
         # Zero displacement at route start, with no discontinuity after climb.
-        north = 1.0 * (math.cos(angle + self.phase) - math.cos(self.phase))
-        east = 1.2 * (math.sin(angle + self.phase) - math.sin(self.phase))
+        bob = BOB_M * (math.sin(angle + self.phase_rad) - math.sin(self.phase_rad))
+        turn = 2.0 * math.pi * hovered_s / TURN_PERIOD_S
         return LocalPoseNed(
-            anchor.north_m + north, anchor.east_m + east, anchor.down_m - self.altitude * climb, anchor.yaw_rad
+            anchor.north_m,
+            anchor.east_m,
+            anchor.down_m - self.altitude_m * climb - bob,
+            math.remainder(anchor.yaw_rad + turn, 2.0 * math.pi),
         )
 
 
@@ -434,8 +464,8 @@ def annotate(cv2: Any, image: Any, result: Any) -> tuple[Any, list[dict[str, Any
     return canvas, detections
 
 
-def record(args: argparse.Namespace, camera: Any, model: Any, flight: Flight, sitl: Sitl, output: Path) -> int:
-    """Write annotated MP4 at wall time speed, with capture times in JSONL."""
+def record(args: argparse.Namespace, stream: Any, model: Any, flight: Flight, sitl: Sitl, output: Path) -> int:
+    """Write annotated MP4 in sim time, every captured frame once, with capture times in JSONL."""
     import cv2
 
     writer = cv2.VideoWriter(
@@ -444,18 +474,22 @@ def record(args: argparse.Namespace, camera: Any, model: Any, flight: Flight, si
     if not writer.isOpened():
         writer.release()
         raise RuntimeError("Cannot open MP4 encoder; use an OpenCV build with FFmpeg")
-    start = time.monotonic()
+    start: float | None = None
     written = 0
     detected = 0
     try:
         with (output / "detections.jsonl").open("w", encoding="utf-8") as log:
-            while time.monotonic() - start < args.duration:
+            while True:
                 flight.check()
                 sitl.check()
-                frame = camera.camera("camera", timeout=10.0)
-                image = frame.image
-                if image.shape[:2] != (args.height, args.width):
-                    raise RuntimeError(f"Unexpected camera size: {image.shape}")
+                frame = stream.read()
+                start = frame.sim_time if start is None else start
+                elapsed = frame.sim_time - start
+                if elapsed >= args.duration:
+                    break
+                if frame.image.shape[:2] != (args.height, args.width):
+                    raise RuntimeError(f"Unexpected camera size: {frame.image.shape}")
+                image = cv2.cvtColor(frame.image, cv2.COLOR_BGRA2BGR)
                 result = model.track(
                     image,
                     persist=True,
@@ -463,11 +497,11 @@ def record(args: argparse.Namespace, camera: Any, model: Any, flight: Flight, si
                     conf=args.conf,
                     imgsz=args.imgsz,
                     device=args.device,
+                    agnostic_nms=True,  # one box per aircraft, under the class it scores higher
                     verbose=False,
                 )[0]
                 canvas, detections = annotate(cv2, image, result)
                 detected += len(detections)
-                elapsed = time.monotonic() - start
                 cv2.putText(
                     canvas,
                     f"PX4 + YOLO | {elapsed:.1f}s | detections {len(detections)}",
@@ -481,16 +515,15 @@ def record(args: argparse.Namespace, camera: Any, model: Any, flight: Flight, si
                     cv2.putText(
                         canvas, "No YOLO detections", (16, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 160, 255), 2
                     )
-                # Duplicate frames if inference is slower than playback FPS.
-                target_count = max(written + 1, math.ceil(min(elapsed, args.duration) * args.fps))
+                # A frame holds the video until the next one the detector takes, so the video keeps sim time.
+                target_count = max(written + 1, math.ceil(elapsed * args.fps))
                 for _ in range(target_count - written):
                     writer.write(canvas)
                 log.write(
                     json.dumps(
                         {
-                            "wall_seconds": elapsed,
-                            "sim_seconds": frame.timestamp,
-                            "sequence": frame.sequence_number,
+                            "sim_seconds": frame.sim_time,
+                            "sequence": frame.frame,
                             "video_frame_start": written,
                             "video_frame_end": target_count,
                             "detections": detections,
@@ -503,13 +536,14 @@ def record(args: argparse.Namespace, camera: Any, model: Any, flight: Flight, si
                     cv2.imshow("PteroSim - PX4 drone detection", canvas)
                     if cv2.waitKey(1) & 0xFF in (27, ord("q")):
                         break
-                time.sleep(max(0.0, written / args.fps - (time.monotonic() - start)))
     finally:
         writer.release()
         if not args.no_preview:
             cv2.destroyAllWindows()
     if not written:
         raise RuntimeError("Camera returned no frames")
+    if stream.dropped:
+        print(f"{stream.dropped} camera frames were overwritten before the detector took them")
     if not detected:
         raise RuntimeError(
             f"Saved video but YOLO detected no drones. Inspect {output}; try --conf 0.15 or custom weights"
@@ -524,14 +558,15 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--sim-host", default="127.0.0.1", help="Simulator address as seen by Linux PX4")
     ap.add_argument("--api-host", default="127.0.0.1", help="Python address as seen by Linux PX4")
     ap.add_argument("--api-port", type=int, default=15540)
+    ap.add_argument("--raw-stream-port", type=int, default=5710, help="Camera frames' port before the instance offset")
     ap.add_argument("--wsl-distro", default="Ubuntu-24.04")
     ap.add_argument("--px4-build", default="~/Documents/PX4-Autopilot/build/px4_sitl_default")
     ap.add_argument("--aircraft-root", type=Path, default=HERE.parents[1] / "PteroSimAircrafts")
     ap.add_argument(
         "--models",
         nargs="+",
-        default=list(VEHICLES),
-        choices=("F450", "x500", "standard_vtol", "tiltrotor", "crazyflie_bl"),
+        default=list(FLEET),
+        choices=VEHICLES,
         help="Hover-capable aircraft to fly, in left-to-right lane order",
     )
     ap.add_argument("--weights", type=Path, help="Custom Ultralytics detection weights; default TomSmail best.pt")
@@ -568,14 +603,17 @@ def main() -> None:
         )
     ):
         raise ValueError("Confidence must be in (0,1]; duration, rates, timeout and sizes must be positive")
+    import numpy as np
     import torch
     from huggingface_hub import hf_hub_download
-    from pterosim import PteroSim
+    from pterosim import PteroSim, RawStream
     from ultralytics import YOLO
 
     torch.set_num_threads(args.inference_threads)
     weights = args.weights or hf_hub_download("TomSmail/drone-yolo-v1", "best.pt")
     model = YOLO(str(weights))
+    # Warm up here: the first inference loads the device for seconds, which would hold the video's first frame.
+    model.predict(np.zeros((args.height, args.width, 3), np.uint8), imgsz=args.imgsz, device=args.device, verbose=False)
     print(f"Detector classes: {model.names}; these are visual predictions, not aircraft model names")
     output = args.output.resolve() / time.strftime("%Y%m%d-%H%M%S")
     output.mkdir(parents=True, exist_ok=False)
@@ -596,8 +634,9 @@ def main() -> None:
             sim.set_mavlink_bind_address("0.0.0.0")
             # Spawn flight vehicles first: HIL system IDs must match PX4 instance + 1.
             for index, name in enumerate(args.models):
+                lane_m = (index - (len(args.models) - 1) / 2) * LANE_SPACING_M
                 aircraft = sim.spawn(
-                    name, x=args.x + 1800.0, y=args.y + (index - (len(args.models) - 1) / 2) * 650.0, z=args.z, yaw=0.0
+                    name, x=args.x + TARGET_DISTANCE_M * CM_PER_M, y=args.y + lane_m * CM_PER_M, z=args.z, yaw=0.0
                 )
                 spawned.append(aircraft)
                 aircraft.set_flight_stack("PX4")
@@ -611,9 +650,17 @@ def main() -> None:
             for sensor in camera.list_sensors():
                 if sensor.type == "camera":
                     camera.set_sensor_param(sensor.name, enabled=sensor.name == "camera", stream=False)
-            camera.set_sensor_pose("camera", position=(0.0, 0.0, 3.0), orientation=(0.0, 12.0, 0.0))
+            camera.set_sensor_pose(
+                "camera", position=(0.0, 0.0, CAMERA_HEIGHT_M), orientation=(0.0, CAMERA_PITCH_DEG, 0.0)
+            )
             camera.set_sensor_param(
-                "camera", image_width=args.width, image_height=args.height, field_of_view=80.0, update_hz=args.fps
+                "camera",
+                image_width=args.width,
+                image_height=args.height,
+                field_of_view=CAMERA_FOV_DEG,
+                update_hz=args.fps,
+                raw_stream=True,
+                raw_stream_port=args.raw_stream_port,
             )
             started = True
             sim.start()
@@ -634,12 +681,18 @@ def main() -> None:
                 )
                 if vehicles[-1].target_system != spawned[index].instance_id + 1:
                     raise RuntimeError("Unexpected MAVLink system ID: another PX4 may own this port")
-            flight = Flight(vehicles, [Route(7.0 + index, index * 1.0) for index in range(len(vehicles))])
+            routes = [
+                Route(BASE_ALTITUDE_M + index * ALTITUDE_STEP_M, 2.0 * math.pi * index / len(vehicles))
+                for index in range(len(vehicles))
+            ]
+            flight = Flight(vehicles, routes)
             flight.thread.start()
             if not flight.ready.wait(90.0):
                 raise TimeoutError("PX4 flight startup timed out")
             flight.check()
-            count = record(args, camera, model, flight, sitl, output)
+            raw_port = args.raw_stream_port + RAW_STREAM_PORTS_PER_INSTANCE * camera.instance_id
+            with RawStream(RAW_STREAM_HOST, raw_port, timeout=CAMERA_TIMEOUT_S, shared_memory=True) as stream:
+                count = record(args, stream, model, flight, sitl, output)
             print(f"Saved {count} frames: {output / 'detections.mp4'}")
         finally:
             try:
