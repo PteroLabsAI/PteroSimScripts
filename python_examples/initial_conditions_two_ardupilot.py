@@ -33,6 +33,7 @@ DEFAULT_DRONE_1 = (35.9524, -112.1470, 1979.0)
 DEFAULT_DRONE_2 = (35.9524, -112.1468, 1979.0)
 # The rate the ArduPilot SITL page of the docs recommends; the printed command flew both drones at it.
 ARDUPILOT_PHYSICS_HZ = 1000.0
+# WGS84 bounds: the poles and the antimeridian.
 LAT_LIMIT_DEG = 90.0
 LON_LIMIT_DEG = 180.0
 
@@ -92,10 +93,7 @@ def main() -> int:
         if not args.no_start:
             sim.start()
         status = sim.status()
-        print(
-            f"Simulation: running={status.is_running}, physics={status.physics_frequency_hz:g} Hz, "
-            f"local start={args.start_time.isoformat()}, weather={args.weather}"
-        )
+        print(f"Simulation: running={status.is_running}, physics={status.physics_frequency_hz:g} Hz")
         print(
             f"Fly them with ArduPilot SITL, run from the PteroSimAircrafts/{AIRCRAFT} folder:\n"
             f"  sim_vehicle.py -v ArduCopter -f quad --model JSON:127.0.0.1 -n {len(drones)} --auto-sysid "
