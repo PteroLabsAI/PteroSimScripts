@@ -14,9 +14,8 @@ The altitude is WGS84 metres. Ground spawns stand on loaded terrain; the
 altitude does not set height above ground. Pick flat ground: a drone spawned on
 a slope tips over and slides down it once the simulation starts.
 
-The script ends by printing the ArduPilot SITL command that flies both drones.
-Its JSON:127.0.0.1 reaches the simulator from SITL on the same machine, or from
-WSL with networkingMode=mirrored; otherwise put the Windows host's address there.
+The script ends by pointing at the docs page whose ArduPilot SITL command
+flies both drones.
 """
 
 from __future__ import annotations
@@ -28,10 +27,12 @@ from datetime import datetime
 from pterosim import PteroSim
 
 AIRCRAFT = "x500"
+# The page top, not the section: WIN_HOST and --no-wsl2-network are set in the page's opening paragraphs.
+SITL_DOCS_URL = "https://pterosimdocs.readthedocs.io/en/latest/sitl_simulation_ardupilot.html"
 # Grand Canyon airport (KGCN): x500s stood level there (0.2 deg) on 2026-11-19; alt is the ground measured then.
 DEFAULT_DRONE_1 = (35.9524, -112.1470, 1979.0)
 DEFAULT_DRONE_2 = (35.9524, -112.1468, 1979.0)
-# The rate the ArduPilot SITL page of the docs recommends; the printed command flew both drones at it.
+# The rate the ArduPilot SITL page of the docs recommends; that page's command flew both drones at it.
 ARDUPILOT_PHYSICS_HZ = 1000.0
 # WGS84 bounds: the poles and the antimeridian.
 LAT_LIMIT_DEG = 90.0
@@ -94,11 +95,7 @@ def main() -> int:
             sim.start()
         status = sim.status()
         print(f"Simulation: running={status.is_running}, physics={status.physics_frequency_hz:g} Hz")
-        print(
-            f"Fly them with ArduPilot SITL, run from the PteroSimAircrafts/{AIRCRAFT} folder:\n"
-            f"  sim_vehicle.py -v ArduCopter -f quad --model JSON:127.0.0.1 -n {len(drones)} --auto-sysid "
-            f"--add-param-file=firmwares/ardupilot_{AIRCRAFT}.param"
-        )
+        print(f"Fly them with ArduPilot SITL: see 'Several aircraft of one type' in {SITL_DOCS_URL}")
     return 0
 
 
